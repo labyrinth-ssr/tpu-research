@@ -8,7 +8,7 @@ import functools
 def solve_unit_lower_triangular(A, b):
     """
     Solves (I + A) x = b for x, where A is strictly lower triangular.
-    Uses block-based forward substitution for better performance on TPU.
+    Uses recursive divide-and-conquer to leverage TPU Matmuls.
     
     Args:
         A: (N, N) strictly lower triangular matrix in VMEM.
@@ -17,70 +17,48 @@ def solve_unit_lower_triangular(A, b):
     Returns:
         x: (N, D) solution matrix.
     """
-    N, D = b.shape
-    # Block size for vectorized updates
-    B = 16 
-    num_blocks = N // B
+    N = A.shape[0]
     
-    # Split b into blocks to avoid dynamic_update_slice
-    # blocks will be a list of (B, D) arrays
-    blocks = jnp.split(b, num_blocks, axis=0)
+    # Base case: Size 1
+    # (I + 0) * x = b => x = b
+    if N == 1:
+        return b
+        
+    # Split into quadrants
+    mid = N // 2
     
-    for i in range(num_blocks):
-        start = i * B
-        end = (i + 1) * B
-        
-        # 1. Solve the current diagonal block row-by-row
-        A_ii = A[start:end, start:end]
-        x_block = blocks[i]
-        
-        # Unroll the inner loop using list of rows to avoid DUS
-        rows = [x_block[r] for r in range(B)]
-        for j in range(B):
-            if j > 0:
-                vec = A_ii[j, :j][None, :]  # Shape (1, j)
-                # Stack previously solved rows to form matrix
-                mat = jnp.stack(rows[:j])   # Shape (j, D)
-                # correction = jnp.dot(vec, mat).squeeze(axis=0) # Shape (D,)
-                correction = jax.lax.dot_general(
-                    vec, mat,
-                    (((1,), (0,)), ((), ())),
-                    precision=jax.lax.Precision.HIGHEST
-                ).squeeze(axis=0)
-                rows[j] = rows[j] - correction
-        
-        x_block = jnp.stack(rows)
-        blocks[i] = x_block
-        
-        # 2. Update remaining rows using a single matmul
-        if i < num_blocks - 1:
-            rest_start = (i + 1) * B
-            
-            # Form the rest of x as a single array for vectorized update
-            x_rest = jnp.concatenate(blocks[i+1:], axis=0) # ((N-end), D)
-            
-            A_rest = A[rest_start:, start:end] # ((N-end), B)
-            
-            # update = A_rest @ x_block
-            # update = jnp.dot(A_rest, x_block)
-            update = jax.lax.dot_general(
-                A_rest, x_block,
-                (((1,), (0,)), ((), ())),
-                precision=jax.lax.Precision.HIGHEST
-            )
-            x_rest = x_rest - update
-            
-            # Split back into blocks
-            remaining_blocks_count = num_blocks - 1 - i
-            new_blocks = jnp.split(x_rest, remaining_blocks_count, axis=0)
-            
-            # Update the list
-            for k, nb in enumerate(new_blocks):
-                blocks[i + 1 + k] = nb
-            
-    # Reassemble final result
-    x = jnp.concatenate(blocks, axis=0)
-    return x
+    # A structure:
+    # [ A00   0 ]
+    # [ A10 A11 ]
+    # Note: A is strictly lower triangular, so diagonal blocks are also strictly lower triangular.
+    # The system is:
+    # (I + A00) x0 = b0
+    # A10 x0 + (I + A11) x1 = b1  =>  (I + A11) x1 = b1 - A10 x0
+    
+    A00 = A[:mid, :mid]
+    A10 = A[mid:, :mid]
+    A11 = A[mid:, mid:]
+    
+    b0 = b[:mid]
+    b1 = b[mid:]
+    
+    # 1. Solve top half recursively
+    x0 = solve_unit_lower_triangular(A00, b0)
+    
+    # 2. Update bottom RHS: b1' = b1 - A10 @ x0
+    # Use precision=HIGHEST for stability
+    correction = jax.lax.dot_general(
+        A10.astype(jnp.float32), x0.astype(jnp.float32),
+        (((1,), (0,)), ((), ())),
+        precision=jax.lax.Precision.HIGHEST
+    ).astype(b.dtype)
+    
+    b1_prime = b1 - correction
+    
+    # 3. Solve bottom half recursively
+    x1 = solve_unit_lower_triangular(A11, b1_prime)
+    
+    return jnp.concatenate([x0, x1], axis=0)
 
 def kda_intra_chunk_kernel(
     # Inputs (Ref)
