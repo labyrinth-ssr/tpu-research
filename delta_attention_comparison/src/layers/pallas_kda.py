@@ -86,7 +86,7 @@ def kda_intra_chunk_kernel(
     # Inputs (Ref)
     k_ref, g_ref, beta_ref, v_ref,
     # Outputs (Ref)
-    u_out_ref, w_out_ref,
+    u_out_ref, w_out_ref, A_out_ref,
     # Config
     chunk_size: int,
     head_dim: int,
@@ -119,22 +119,27 @@ def kda_intra_chunk_kernel(
     # Apply Beta and Mask
     # A[i, j] = A_raw[i, j] * beta[i] if i > j else 0
     A = A_raw * beta
+    # jax.debug.print("A matrix stats, max:{}, min: {}", A.max().view(jnp.int32), A.min().view(jnp.int32))
     
     # 2. Batch solve for u and w
-    # (I + A) u_unscaled = v
-    # (I + A) w_unscaled = k * exp(g)
+    # (I + A) u = v * beta
+    # (I + A) w = k * exp(g) * beta
     
-    target_w = k * jnp.exp(g)
+    # Apply beta to RHS inputs BEFORE solving
+    v_scaled = v * beta
+    target_w = k * jnp.exp(g) * beta
+    
     # Combine inputs along D axis to solve together: (C, 2D)
-    combined_b = jnp.concatenate([v, target_w], axis=-1)
+    combined_b = jnp.concatenate([v_scaled, target_w], axis=-1)
     combined_x = solve_unit_lower_triangular(A, combined_b)
     
-    u = combined_x[:, :head_dim] * beta
-    w = combined_x[:, head_dim:] * beta
+    u = combined_x[:, :head_dim]
+    w = combined_x[:, head_dim:]
     
     # Store outputs
     u_out_ref[0, 0, 0] = u
     w_out_ref[0, 0, 0] = w
+    A_out_ref[0, 0, 0] = A
 
 @functools.partial(jax.jit, static_argnames=['chunk_size'])
 def kda_intra_chunk_fwd(
@@ -157,6 +162,7 @@ def kda_intra_chunk_fwd(
     Returns:
         u: (B, H, T, D)
         w: (B, H, T, D)
+        A: (B, H, num_chunks, chunk_size, chunk_size)
     """
     B, H, T, D = k.shape
     assert T % chunk_size == 0, "Sequence length must be divisible by chunk_size"
@@ -174,11 +180,12 @@ def kda_intra_chunk_fwd(
     # Can interpret output as (B, H, num_chunks, chunk_size, D) and then reshape back
     
     # Pallas Call
-    u_reshaped, w_reshaped = pl.pallas_call(
+    u_reshaped, w_reshaped, A_reshaped = pl.pallas_call(
         functools.partial(kda_intra_chunk_kernel, chunk_size=chunk_size, head_dim=D),
         out_shape=[
             jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype),
-            jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype)
+            jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype),
+            jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, chunk_size), dtype=k.dtype)
         ],
         in_specs=[
             pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # k
@@ -189,9 +196,10 @@ def kda_intra_chunk_fwd(
         out_specs=[
             pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # u
             pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # w
+            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, chunk_size)), # A
         ],
         grid=grid,
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel","parallel")),
     )(k_reshaped, g_reshaped, beta_reshaped, v_reshaped)
     
-    return u_reshaped.reshape(B, H, T, D), w_reshaped.reshape(B, H, T, D)
+    return u_reshaped.reshape(B, H, T, D), w_reshaped.reshape(B, H, T, D), A_reshaped

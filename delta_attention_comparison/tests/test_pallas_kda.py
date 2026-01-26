@@ -121,7 +121,7 @@ class TestPallasKDA(unittest.TestCase):
         # Run Pallas
         print("Running Pallas...")
         try:
-            u_pallas, w_pallas = kda_intra_chunk_fwd(k, g_in, beta, v, chunk_size=chunk_size)
+            u_pallas, w_pallas, _ = kda_intra_chunk_fwd(k, g_in, beta, v, chunk_size=chunk_size)
         except Exception as e:
             print(f"Pallas execution failed (expected if not on TPU): {e}")
             # Skip assertion if Pallas fails (e.g. on CPU)

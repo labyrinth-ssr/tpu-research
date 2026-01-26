@@ -146,7 +146,9 @@ def main():
             t_jax = benchmark_fn("JAX", jax_intra_chunk_fwd, args)
             
             # Benchmark Pallas
-            t_pallas = benchmark_fn("Pallas", kda_intra_chunk_fwd, args)
+            # Drop A (3rd output) to match JAX signature
+            pallas_wrapper = lambda *a: kda_intra_chunk_fwd(*a)[:2]
+            t_pallas = benchmark_fn("Pallas", pallas_wrapper, args)
             
             speedup = t_jax / t_pallas
             print(f"{B:<4} | {T:<6} | {H:<3} | {D:<3} | {t_jax:<10.3f} | {t_pallas:<12.3f} | {speedup:<8.2f}x")
