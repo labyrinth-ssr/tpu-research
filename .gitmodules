@@ -3,4 +3,4 @@
 	url = https://github.com/openxla/tokamax.git
 [submodule "fla"]
 	path = fla
-	url = https://github.com/fla-org/flash-linear-attention.git
+	url = https://github.com/labyrinth-ssr/flash-linear-attention.git
