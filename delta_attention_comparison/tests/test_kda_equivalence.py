@@ -71,7 +71,7 @@ def test_kda_equivalence(B_list=[1, 2, 4, 8], L_list=[1024, 2048, 4096, 8192, 16
                 head_dim=D,
                 num_v_heads=NV,
                 conv_kernel_size=K,
-                dtype=jnp.float32,
+                dtype=jnp.bfloat16,
                 rngs=rngs
             )
             
@@ -115,7 +115,7 @@ def test_kda_equivalence(B_list=[1, 2, 4, 8], L_list=[1024, 2048, 4096, 8192, 16
             x_jax = jnp.array(x_np)
 
             # Generate random upstream gradient
-            dy_np = np.random.randn(B, L, H).astype(np.float32)
+            dy_np = np.random.randn(B, L, H).astype(np.bfloat16)
             dy_pt = torch.tensor(dy_np, device=device)
             dy_jax = jnp.array(dy_np)
             

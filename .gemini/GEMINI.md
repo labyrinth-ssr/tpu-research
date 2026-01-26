@@ -24,7 +24,7 @@
 *   **Hardware:** Google Cloud TPU (v4, v5e, v6e) & NVIDIA GPUs.
 *   **Orchestrator:** SkyPilot.
 
-## 3. Remote Development Workflow (TPU & GPU)
+<!-- ## 3. Remote Development Workflow (TPU & GPU)
 
 ### Step 1: Provisioning
 To start or update a cluster. Both scripts update their respective cluster name files.
@@ -62,7 +62,7 @@ bash scripts/sync_code.sh gpu && sky exec $(cat .cluster_name_gpu) "export CUDA_
 
 ### Step 3: Debugging
 *   **Status Check:** `sky status`
-*   **Logs:** SkyPilot streams stdout/stderr to your local terminal.
+*   **Logs:** SkyPilot streams stdout/stderr to your local terminal. -->
 
 ## 4. Pallas Kernel Guide (JAX)
 

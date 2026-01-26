@@ -28,33 +28,39 @@ def compute_chunk_vars_ref(k_blk, g_blk, beta_blk, v_blk, chunk_size=128):
         w: (C, D)
     """
     prec = jax.lax.Precision.HIGHEST
-
-    # g_diff: (C, C, D)
-    # g_diff[i, j] = g[i] - g[j]
-    g_diff = g_blk[:, None, :] - g_blk[None, :, :]
+    g_diff = jnp.expand_dims(g_blk, -2) - jnp.expand_dims(g_blk, -3)
+    decay_full = jnp.exp(g_diff)
     
     idx = jnp.arange(chunk_size)
+    
+    # [STRICT MASK] Stage 2: i > j (Strict Lower)
+    # Matches PyTorch triu(0) masked_fill 0
     mask = idx[:, None] > idx[None, :] 
+    decay_mask = jnp.where(jnp.expand_dims(mask, -1), decay_full, 0.0)
     
-    # Mask positive exponents (j > i) to avoid overflow
-    safe_g_diff = jnp.where(jnp.expand_dims(mask, -1), g_diff, -float('inf'))
-    
-    # term: (C, C, D)
-    term = (k_blk[:, None, :] * k_blk[None, :, :]) * jnp.exp(safe_g_diff)
-    
-    A_raw = jnp.sum(term, axis=-1)
+    A_raw = jnp.einsum('id, jd, ijd -> ij', k_blk, k_blk, decay_mask, precision=prec)
 
+    # [BETA ROW]
     A = A_raw * jnp.expand_dims(beta_blk, -1)
     
-    # T = (I + A)^{-1}
-    eye = jnp.eye(chunk_size, dtype=A.dtype)
-    L = eye + A
-    T = jax.scipy.linalg.solve_triangular(L, eye, lower=True)
+    # [INVERT] Matches PyTorch logic A = -A then closure
+    A_neg = -A
     
-    # T_final = T * diag(beta)
-    # T_final[i, :] = T[i, :] * beta[i]
-    T_final = T * jnp.expand_dims(beta_blk, -1) 
+    def invert_body(i, m):
+        row = m[i]
+        mask_idx = jnp.arange(chunk_size) < i
+        row = jnp.where(mask_idx, row, 0.0)
+        increment = jnp.dot(row, m, precision=prec)
+        increment = jnp.where(mask_idx, increment, 0.0)
+        return m.at[i].set(row + increment)
+
+    A_inv = jax.lax.fori_loop(1, chunk_size, invert_body, A_neg)
     
+    # [BETA COL] Matches PyTorch (A_inv + I) * beta_col
+    T = A_inv + jnp.eye(chunk_size)
+    T_final = T * jnp.expand_dims(beta_blk, -2) 
+    
+    # Compute u, w
     u = jnp.matmul(T_final, v_blk, precision=prec)
     w = jnp.matmul(T_final, k_blk * jnp.exp(g_blk), precision=prec)
     
@@ -79,6 +85,8 @@ class TestPallasKDA(unittest.TestCase):
         
         # Init inputs
         k = random.normal(k1, (B, H, T, D), dtype=dtype)
+        # Normalize K to prevent A matrix explosion
+        k = k / jnp.linalg.norm(k, axis=-1, keepdims=True)
         # g is log-sigmoid, so negative values. cumsum makes them decreasing.
         g_raw = jax.nn.log_sigmoid(random.normal(k2, (B, H, T, D), dtype=dtype))
         
@@ -132,8 +140,8 @@ class TestPallasKDA(unittest.TestCase):
         print(f"Max Diff W: {diff_w}")
         
         # Tolerances
-        atol = 2e-3 if dtype == jnp.float32 else 1e-2
-        rtol = 2e-3 if dtype == jnp.float32 else 1e-2
+        atol = 1e-4 if dtype == jnp.float32 else 1e-2
+        rtol = 1e-4 if dtype == jnp.float32 else 1e-2
         
         np.testing.assert_allclose(u_pallas, u_ref, atol=atol, rtol=rtol, err_msg="U mismatch")
         np.testing.assert_allclose(w_pallas, w_ref, atol=atol, rtol=rtol, err_msg="W mismatch")

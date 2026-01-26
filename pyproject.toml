@@ -15,6 +15,10 @@ dependencies = [
     "matplotlib>=3.10.8",
     "transformers",
     "einops",
+    "pytest",
+    "torch",
+    "transformers",
+    "einops",
 ]
 
 [project.optional-dependencies]
