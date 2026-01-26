@@ -17,32 +17,51 @@ from src.layers.pallas_kda import kda_intra_chunk_fwd
 
 def compute_chunk_vars_ref(k_blk, g_blk, beta_blk, v_blk, chunk_size=128):
     """
-    Standard JAX implementation of the intra-chunk logic using solve_triangular.
+    Reference implementation of KDA intra-chunk computation.
+    
+    Args:
+        k_blk: (C, D)
+        g_blk: (C, D) - cumulative sum of logs
+        beta_blk: (C,)
+        v_blk: (C, D)
+    Returns:
+        u: (C, D)
+        w: (C, D)
     """
     prec = jax.lax.Precision.HIGHEST
-
-    # g_diff[i, j] = g[i] - g[j]
-    g_diff = g_blk[:, None, :] - g_blk[None, :, :]
+    g_diff = jnp.expand_dims(g_blk, -2) - jnp.expand_dims(g_blk, -3)
+    decay_full = jnp.exp(g_diff)
     
     idx = jnp.arange(chunk_size)
+    
+    # [STRICT MASK] Stage 2: i > j (Strict Lower)
+    # Matches PyTorch triu(0) masked_fill 0
     mask = idx[:, None] > idx[None, :] 
+    decay_mask = jnp.where(jnp.expand_dims(mask, -1), decay_full, 0.0)
     
-    # Mask positive exponents
-    safe_g_diff = jnp.where(jnp.expand_dims(mask, -1), g_diff, -float('inf'))
-    
-    # A = tril(K * K^T * exp(g_diff)) * beta
-    term = (k_blk[:, None, :] * k_blk[None, :, :]) * jnp.exp(safe_g_diff)
-    A_raw = jnp.sum(term, axis=-1)
+    A_raw = jnp.einsum('id, jd, ijd -> ij', k_blk, k_blk, decay_mask, precision=prec)
+
+    # [BETA ROW]
     A = A_raw * jnp.expand_dims(beta_blk, -1)
     
-    eye = jnp.eye(chunk_size, dtype=A.dtype)
-    L = eye + A
+    # [INVERT] Matches PyTorch logic A = -A then closure
+    A_neg = -A
     
-    # Solve (I + A) X = [V, K*exp(g)]
-    # We solve them separately here for clarity, though concatenation is possible
-    T = jax.scipy.linalg.solve_triangular(L, eye, lower=True)
-    T_final = T * jnp.expand_dims(beta_blk, -1) 
+    def invert_body(i, m):
+        row = m[i]
+        mask_idx = jnp.arange(chunk_size) < i
+        row = jnp.where(mask_idx, row, 0.0)
+        increment = jnp.dot(row, m, precision=prec)
+        increment = jnp.where(mask_idx, increment, 0.0)
+        return m.at[i].set(row + increment)
+
+    A_inv = jax.lax.fori_loop(1, chunk_size, invert_body, A_neg)
     
+    # [BETA COL] Matches PyTorch (A_inv + I) * beta_col
+    T = A_inv + jnp.eye(chunk_size)
+    T_final = T * jnp.expand_dims(beta_blk, -2) 
+    
+    # Compute u, w
     u = jnp.matmul(T_final, v_blk, precision=prec)
     w = jnp.matmul(T_final, k_blk * jnp.exp(g_blk), precision=prec)
     
@@ -107,7 +126,7 @@ def main():
     H = 16
     D = 128
     CHUNK_SIZE = 256
-    DTYPE = jnp.bfloat16
+    DTYPE = jnp.float32
     
     # Batch sizes and Sequence lengths to test
     configs = [

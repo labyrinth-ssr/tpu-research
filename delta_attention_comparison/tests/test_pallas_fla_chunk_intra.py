@@ -47,6 +47,8 @@ class TestKDAIntraChunk(unittest.TestCase):
         k = torch.randn(B, T, H, D, dtype=dtype, device=device)
         q = F.normalize(q, p=2, dim=-1)
         k = F.normalize(k, p=2, dim=-1)
+
+        safe_gate = True
         
         v = torch.randn(B, T, H, D, dtype=dtype, device=device)
         
@@ -110,7 +112,8 @@ class TestKDAIntraChunk(unittest.TestCase):
                 gk=g_fla,
                 beta=beta, 
                 scale=scale, 
-                chunk_size=chunk_size
+                chunk_size=chunk_size,
+                safe_gate=safe_gate
             )
             
             # Fla returns (B, T, H, D). Permute to compare with Pallas (B, H, T, D).

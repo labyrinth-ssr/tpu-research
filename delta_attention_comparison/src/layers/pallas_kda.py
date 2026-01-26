@@ -98,27 +98,36 @@ def kda_intra_chunk_kernel(
     beta = beta_ref[0, 0, 0] # (C, 1)
     v = v_ref[0, 0, 0]
 
-    # 1. Compute A matrix
+    # 1. Compute A matrix using factorization for TPU MXU efficiency
     # A_raw_ij = sum_d k_id * k_jd * exp(g_id - g_jd)
+    # Factorization: exp(g_i - g_j) = exp(g_i - g_ref) * exp(g_ref - g_j)
+    # We choose g_ref to be the middle of the chunk for numerical stability (Safe Gate)
+    
+    # Pick reference g from the middle of the chunk
+    g_ref_idx = chunk_size // 2
+    g_ref = g[g_ref_idx][None, :] # (1, D)
+    g_centered = g - g_ref # (C, D)
+
+    # Compute Q and K states for matrix multiplication
+    # q_state = k * exp(g - g_ref)
+    # k_state = k * exp(g_ref - g)
+    q_state = k * jnp.exp(g_centered)
+    k_state = k * jnp.exp(-g_centered)
+    
+    # Perform Matrix Multiplication (C, D) @ (D, C) -> (C, C)
+    # This maps to TPU MXU instructions
+    A_raw = jax.lax.dot_general(
+        q_state, k_state,
+        (((1,), (1,)), ((), ())),
+        precision=jax.lax.Precision.HIGHEST
+    )
+    
+    # Apply Mask and Beta
     idx = jnp.arange(chunk_size, dtype=jnp.int32)
     mask = idx[:, None] > idx[None, :]
     
-    # Broadcast g to (C, C, D)
-    g_diff = g[:, None, :] - g[None, :, :]
-    
-    # Use einsum and log-space masking for efficiency and stability
-    # Use additive masking to avoid boolean broadcast issues in Pallas TPU (vector<i1> reshape issue)
-    mask_val = jnp.where(mask, 0.0, -jnp.inf)
-    safe_g_diff = g_diff + mask_val[:, :, None]
-    
-    # Revert to broadcast and sum to avoid Pallas lowering issues with complex einsum.
-    k_outer = k[:, None, :] * k[None, :, :]
-    term = k_outer * jnp.exp(safe_g_diff)
-    A_raw = jnp.sum(term, axis=-1)
-    
-    # Apply Beta and Mask
     # A[i, j] = A_raw[i, j] * beta[i] if i > j else 0
-    A = A_raw * beta
+    A = jnp.where(mask, A_raw * beta, 0.0)
     # jax.debug.print("A matrix stats, max:{}, min: {}", A.max().view(jnp.int32), A.min().view(jnp.int32))
     
     # 2. Batch solve for u and w
