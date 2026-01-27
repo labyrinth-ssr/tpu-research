@@ -149,6 +149,7 @@ def main():
         key = jax.random.PRNGKey(0)
         k1, k2, k3, k4 = jax.random.split(key, 4)
         
+        q = jax.random.normal(k1, (B, H, T, D), dtype=DTYPE)
         k = jax.random.normal(k1, (B, H, T, D), dtype=DTYPE)
         g_raw = jax.nn.log_sigmoid(jax.random.normal(k2, (B, H, T, D), dtype=DTYPE))
         # Ensure g is cumsum-ed as expected by kernel
@@ -159,6 +160,7 @@ def main():
         v = jax.random.normal(k4, (B, H, T, D), dtype=DTYPE)
         
         args = (k, g, beta, v, CHUNK_SIZE)
+        args_pallas = (q,k, g, beta, v, CHUNK_SIZE)
 
         try:
             # Benchmark JAX
@@ -167,7 +169,7 @@ def main():
             # Benchmark Pallas
             # Drop A (3rd output) to match JAX signature
             pallas_wrapper = lambda *a: kda_intra_chunk_fwd(*a)[:2]
-            t_pallas = benchmark_fn("Pallas", pallas_wrapper, args)
+            t_pallas = benchmark_fn("Pallas", pallas_wrapper, args_pallas)
             
             speedup = t_jax / t_pallas
             print(f"{B:<4} | {T:<6} | {H:<3} | {D:<3} | {t_jax:<10.3f} | {t_pallas:<12.3f} | {speedup:<8.2f}x")

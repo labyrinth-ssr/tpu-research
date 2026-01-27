@@ -140,7 +140,7 @@ class TestPallasKDA(unittest.TestCase):
         print(f"Max Diff W: {diff_w}")
         
         # Tolerances
-        atol = 1e-4 if dtype == jnp.float32 else 1e-2
+        atol = 1e-6 if dtype == jnp.float32 else 1e-2
         rtol = 1e-4 if dtype == jnp.float32 else 1e-2
         
         np.testing.assert_allclose(u_pallas, u_ref, atol=atol, rtol=rtol, err_msg="U mismatch")
