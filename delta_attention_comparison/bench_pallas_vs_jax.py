@@ -126,7 +126,7 @@ def main():
     H = 16
     D = 128
     CHUNK_SIZE = 256
-    DTYPE = jnp.float32
+    DTYPE = jnp.bfloat16
     
     # Batch sizes and Sequence lengths to test
     configs = [

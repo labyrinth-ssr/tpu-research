@@ -64,7 +64,7 @@ def compute_chunk_vars_ref(k_blk, g_blk, beta_blk, v_blk, chunk_size=128):
     u = jnp.matmul(T_final, v_blk, precision=prec)
     w = jnp.matmul(T_final, k_blk * jnp.exp(g_blk), precision=prec)
     
-    return u, w
+    return u, w, T
 
 # Vmap over Batch, Heads, and Chunks
 compute_chunk_ref_vmap = jax.vmap(jax.vmap(jax.vmap(compute_chunk_vars_ref, in_axes=(0,0,0,0,None)), in_axes=(0,0,0,0,None)), in_axes=(0,0,0,0,None))
@@ -77,16 +77,18 @@ class TestPallasKDA(unittest.TestCase):
         # Config
         B, H, T, D = 1, 2, 256, 128
         chunk_size = 128
-        dtype = jnp.float32
+        dtype = jnp.bfloat16
         
         # Seeds
         key = random.PRNGKey(0)
-        k1, k2, k3, k4 = random.split(key, 4)
+        k1, k2, k3, k4, k5 = random.split(key, 5)
         
         # Init inputs
         k = random.normal(k1, (B, H, T, D), dtype=dtype)
+        q = random.normal(k5, (B, H, T, D), dtype=dtype)
         # Normalize K to prevent A matrix explosion
         k = k / jnp.linalg.norm(k, axis=-1, keepdims=True)
+        q = q / jnp.linalg.norm(q, axis=-1, keepdims=True)
         # g is log-sigmoid, so negative values. cumsum makes them decreasing.
         g_raw = jax.nn.log_sigmoid(random.normal(k2, (B, H, T, D), dtype=dtype))
         
@@ -114,14 +116,15 @@ class TestPallasKDA(unittest.TestCase):
         g_c_ref = g_cumsum # Already chunked and summed
         
         print("Running Reference...")
-        u_ref_c, w_ref_c = compute_chunk_ref_vmap(k_c, g_c_ref, beta_c, v_c, chunk_size)
+        u_ref_c, w_ref_c, T_ref_c = compute_chunk_ref_vmap(k_c, g_c_ref, beta_c, v_c, chunk_size)
         u_ref = u_ref_c.reshape(B, H, T, D)
         w_ref = w_ref_c.reshape(B, H, T, D)
-        
+        A_ref = T_ref_c.reshape(B, H, T, D)
+
         # Run Pallas
         print("Running Pallas...")
         try:
-            u_pallas, w_pallas, _ = kda_intra_chunk_fwd(k, g_in, beta, v, chunk_size=chunk_size)
+            u_pallas, w_pallas, _, _, _, A_pallas = kda_intra_chunk_fwd(q, k, g_in, beta, v, chunk_size=chunk_size)
         except Exception as e:
             print(f"Pallas execution failed (expected if not on TPU): {e}")
             # Skip assertion if Pallas fails (e.g. on CPU)
@@ -133,11 +136,14 @@ class TestPallasKDA(unittest.TestCase):
 
         # Check
         print("Comparing results...")
+        A_pallas = A_pallas.reshape(B, H, T, D)
         diff_u = jnp.max(jnp.abs(u_ref - u_pallas))
         diff_w = jnp.max(jnp.abs(w_ref - w_pallas))
+        diff_A = jnp.max(jnp.abs(A_ref - A_pallas))
         
         print(f"Max Diff U: {diff_u}")
         print(f"Max Diff W: {diff_w}")
+        print(f"Max Diff A: {diff_A}")
         
         # Tolerances
         atol = 1e-6 if dtype == jnp.float32 else 1e-2
