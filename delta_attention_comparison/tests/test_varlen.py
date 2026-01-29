@@ -30,10 +30,10 @@ class TestPallasVarLen(unittest.TestCase):
         assert total_T % chunk_size == 0
         
         # 1. Generate Input Data (Single batch, packed)
-        q = torch.randn(1, total_T, H, D)
-        k = torch.randn(1, total_T, H, D)
-        q = F.normalize(q, p=2, dim=-1)
-        k = F.normalize(k, p=2, dim=-1)
+        q1 = torch.randn(1, total_T, H, D)
+        k1 = torch.randn(1, total_T, H, D)
+        q = F.normalize(q1, p=2, dim=-1)
+        k = F.normalize(k1, p=2, dim=-1)
         v = torch.randn(1, total_T, H, D)
         beta = torch.randn(1, total_T, H).sigmoid()
         
@@ -42,13 +42,6 @@ class TestPallasVarLen(unittest.TestCase):
         # The Kernel masking logic should work regardless of G values.
         # However, to be strict, let's just use random values and assume they are pre-cumsumed.
         g = torch.randn(1, total_T, H, D)
-        
-        # 2. Define Segment IDs (VarLen Layout)
-        # Create 3 segments:
-        # Seq 0: [0, 150) -> spans chunk 0, 1
-        # Seq 1: [150, 200) -> inside chunk 1
-        # Seq 2: [200, 1024) -> spans chunk 1...7
-        # Seq 3: [1024, 2048) -> spans chunk 8...15
         
         # Simplified for chunks:
         # Let's make random cuts
@@ -118,11 +111,14 @@ class TestPallasVarLen(unittest.TestCase):
         print("Verifying Isolation Property...")
         
         # Create a perturbed input
-        q_perturb = q.clone()
-        k_perturb = k.clone()
+        q1_perturb = q1.clone()
+        k1_perturb = k1.clone()
         # Perturb the first sequence (0:100) significantly
-        q_perturb[:, 0:100] += torch.randn_like(q_perturb[:, 0:100]) * 10
-        k_perturb[:, 0:100] += torch.randn_like(k_perturb[:, 0:100]) * 10
+        q1_perturb[:, 0:100] = torch.randn_like(q1_perturb[:, 0:100])
+        k1_perturb[:, 0:100] = torch.randn_like(k1_perturb[:, 0:100])
+
+        q_perturb = F.normalize(q1_perturb, p=2, dim=-1)
+        k_perturb = F.normalize(k1_perturb, p=2, dim=-1)
         
         q_perturb_jax = jnp.array(q_perturb.permute(0, 2, 1, 3).numpy())
         k_perturb_jax = jnp.array(k_perturb.permute(0, 2, 1, 3).numpy())
@@ -140,6 +136,9 @@ class TestPallasVarLen(unittest.TestCase):
         
         seq1_start, seq1_end = splits[1], splits[2]
         print(f"Checking Seq 1 range: [{seq1_start}, {seq1_end})")
+
+        print(" u_packed nan: ", np.isnan(u_packed).any())
+        print(" u_perturb nan: ", np.isnan(u_perturb).any())
         
         diff_seq1 = np.abs(u_packed[:, :, seq1_start:seq1_end, :] - u_perturb[:, :, seq1_start:seq1_end, :]).max()
         print(f"Max Diff in Seq 1 after perturbing Seq 0: {diff_seq1:.6e}")

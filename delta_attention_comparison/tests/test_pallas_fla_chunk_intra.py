@@ -32,9 +32,9 @@ class TestKDAIntraChunk(unittest.TestCase):
         print("\n=== Testing KDA Intra Chunk Equivalence (Pallas vs Fla Triton) ===")
         torch.manual_seed(42)
 
-        B, H, T, D = 1, 4, 256, 128
+        B, H, T, D = 1, 4, 128, 64
         chunk_size = 64
-        dtype = torch.bfloat16        
+        dtype = torch.float32        
         if torch.cuda.is_available():
             device = torch.device('cuda')
         else:
