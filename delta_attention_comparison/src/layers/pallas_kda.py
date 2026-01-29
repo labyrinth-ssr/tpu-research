@@ -39,10 +39,6 @@ def solve_unit_lower_triangular(A, b):
                 correction = jax.lax.dot_general(
                     vec, mat,
                     (((1,), (0,)), ((), ())),
-<<<<<<< HEAD
-                    precision=jax.lax.Precision.HIGHEST,
-=======
->>>>>>> a1d2758
                     preferred_element_type=jnp.float32
                 ).squeeze(axis=0)
                 rows[j] = rows[j] - correction
@@ -59,10 +55,6 @@ def solve_unit_lower_triangular(A, b):
             update = jax.lax.dot_general(
                 A_rest, x_block,
                 (((1,), (0,)), ((), ())),
-<<<<<<< HEAD
-                precision=jax.lax.Precision.HIGHEST,
-=======
->>>>>>> a1d2758
                 preferred_element_type=jnp.float32
             )
             x_rest = x_rest - update
@@ -102,13 +94,8 @@ def kda_intra_chunk_kernel(
     
     # Pick reference g from the middle of the chunk
     g_ref_idx = chunk_size // 2
-<<<<<<< HEAD
-    g_ref = g[g_ref_idx][None, :] # (1, D)
-    g_centered = g.astype(jnp.float32) - g_ref.astype(jnp.float32) # (C, D)
-=======
     g_ref_val = g[g_ref_idx][None, :] # (1, D)
     g_centered = (g.astype(jnp.float32) - g_ref_val.astype(jnp.float32)) # (C, D)
->>>>>>> a1d2758
 
     # Compute Q and K states for matrix multiplication
     # q_state = q * exp(g - g_ref)
@@ -131,29 +118,17 @@ def kda_intra_chunk_kernel(
         k_state_q.astype(k.dtype), 
         k_state_k.astype(k.dtype), 
         (((1,), (1,)), ((), ())),
-<<<<<<< HEAD
-        precision=jax.lax.Precision.DEFAULT,
-        preferred_element_type=jnp.float32
-    )
-=======
         # precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32
     ).astype(dtype)
     
->>>>>>> a1d2758
     # Aqk = q_state @ k_state_k.T * scale
     Aqk_raw = jax.lax.dot_general(
         q_state, k_state_k,
         (((1,), (1,)), ((), ())),
-<<<<<<< HEAD
-        precision=jax.lax.Precision.DEFAULT,
-        preferred_element_type=jnp.float32
-    ).astype(q.dtype)
-=======
         # precision=jax.lax.Precision.HIGHEST
         preferred_element_type=jnp.float32
     ).astype(dtype)
->>>>>>> a1d2758
     
     # Apply Mask and Beta
     idx = jnp.arange(chunk_size, dtype=jnp.int32)
@@ -190,18 +165,6 @@ def kda_intra_chunk_kernel(
     w = combined_x[:, head_dim:2*head_dim]
     Akk_inv = combined_x[:, 2*head_dim:]
     
-<<<<<<< HEAD
-    # Store outputs
-    u_out_ref[0, 0, 0] = u.astype(u_out_ref.dtype)
-    w_out_ref[0, 0, 0] = w.astype(w_out_ref.dtype)
-    qg_out_ref[0, 0, 0] = q_state # Wait, qg != q_state. qg = q * exp(g). q_state = q * exp(g - g_ref).
-    # I need to compute qg separately or adjust.
-    # qg = q * exp(g)
-    # q_state = q * exp(g - g_ref)
-    # So qg = q_state * exp(g_ref)
-    
-=======
->>>>>>> a1d2758
     qg = q * jnp.exp(g)
     
     g_last = g[chunk_size-1][None, :]
