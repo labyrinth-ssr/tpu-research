@@ -105,11 +105,11 @@ class TestKDAIntraChunk(unittest.TestCase):
             scale = 1.0
 
             w_fla, u_fla, qg_fla, kg_fla, Aqk_fla, Akkk_fla = triton_intra(
-                q=q, 
-                k=k, 
-                v=v, 
-                gk=g,
-                beta=beta, 
+                q=q.to(torch.float32), 
+                k=k.to(torch.float32), 
+                v=v.to(torch.float32), 
+                gk=g.to(torch.float32),
+                beta=beta.to(torch.float32), 
                 scale=scale, 
                 chunk_size=chunk_size,
                 safe_gate=safe_gate,

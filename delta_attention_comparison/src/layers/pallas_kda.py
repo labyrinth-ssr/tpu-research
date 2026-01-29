@@ -89,7 +89,7 @@ def kda_intra_chunk_kernel(
     segment_ids = segment_ids_ref[0, 0, 0] 
 
     # 1. Compute A matrix using factorization for TPU MXU efficiency
-    # Factorization: exp(g_i - g_j) = exp(g_i - g_ref) * exp(g_ref - g_j)
+    # Factorization: exp2(g_i - g_j) = exp2(g_i - g_ref) * exp2(g_ref - g_j)
     # We choose g_ref to be the middle of the chunk for numerical stability (Safe Gate)
     
     # Pick reference g from the middle of the chunk
@@ -98,17 +98,17 @@ def kda_intra_chunk_kernel(
     g_centered = (g.astype(jnp.float32) - g_ref_val.astype(jnp.float32)) # (C, D)
 
     # Compute Q and K states for matrix multiplication
-    # q_state = q * exp(g - g_ref)
-    # k_state = k * exp(g_ref - g)
-    q_state = q * jnp.exp(g_centered).astype(q.dtype)
+    # q_state = q * exp2(g - g_ref)
+    # k_state = k * exp2(g_ref - g)
+    q_state = q * jnp.exp2(g_centered).astype(q.dtype)
     
     # Re-use k_state logic for both Aqk and Akk
-    # For Akk: K * exp(g - g_ref) vs K * exp(g_ref - g) logic
-    # In original kda: A_ij = k_i * k_j * exp(g_i - g_j)
-    # = (k_i * exp(g_i - g_ref)) * (k_j * exp(g_ref - g_j))
+    # For Akk: K * exp2(g - g_ref) vs K * exp2(g_ref - g) logic
+    # In original kda: A_ij = k_i * k_j * exp2(g_i - g_j)
+    # = (k_i * exp2(g_i - g_ref)) * (k_j * exp2(g_ref - g_j))
     # Let's call them k_state_q (acts like query) and k_state_k (acts like key)
-    k_state_q = k * jnp.exp(g_centered)
-    k_state_k = k * jnp.exp(-g_centered)
+    k_state_q = k * jnp.exp2(g_centered)
+    k_state_k = k * jnp.exp2(-g_centered)
     
     # Perform Matrix Multiplication (C, D) @ (D, C) -> (C, C)
     # This maps to TPU MXU instructions
@@ -150,12 +150,17 @@ def kda_intra_chunk_kernel(
 
     # 2. Batch solve for u and w and Akk_inv
     # (I + Akk) u = v * beta
-    # (I + Akk) w = k * exp(g) * beta
+    # (I + Akk) w = k * exp2(g) * beta
     # (I + Akk) Akk_inv = I
     
     # Apply beta to RHS inputs BEFORE solving
-    v_scaled = v * beta
-    target_w = k * jnp.exp(g) * beta
+    jax.debug.print("v shape:{}", v.shape)
+    jax.debug.print("beta shape:{}", beta.shape)
+    v_scaled = v.astype(jnp.float32) * beta.astype(jnp.float32)
+    jax.debug.print("v max: {v_max}, min: {v_min}", v_max=jnp.max(v), v_min=jnp.min(v))
+    jax.debug.print("beta max: {beta_max}, min: {beta_min}", beta_max=jnp.max(beta), beta_min=jnp.min(beta))
+    jax.debug.print("v_scaled max: {v_scaled_max}, min: {v_scaled_min}", v_scaled_max=jnp.max(v_scaled), v_scaled_min=jnp.min(v_scaled))
+    target_w = k * jnp.exp2(g) * beta
     identity = jnp.eye(chunk_size, dtype=v.dtype)
     
     combined_b = jnp.concatenate([v_scaled, target_w, identity], axis=-1)
@@ -165,10 +170,10 @@ def kda_intra_chunk_kernel(
     w = combined_x[:, head_dim:2*head_dim]
     Akk_inv = combined_x[:, 2*head_dim:]
     
-    qg = q * jnp.exp(g)
+    qg = q * jnp.exp2(g)
     
     g_last = g[chunk_size-1][None, :]
-    kg = k * jnp.exp(g_last - g)
+    kg = k * jnp.exp2(g_last - g)
 
     u_out_ref[0, 0, 0] = u.astype(u_out_ref.dtype)
     w_out_ref[0, 0, 0] = w.astype(w_out_ref.dtype)
@@ -232,6 +237,7 @@ def kda_intra_chunk_fwd(
     # Pallas Call
     u_reshaped, w_reshaped, qg_reshaped, kg_reshaped, Aqk_reshaped, Akk_inv_reshaped = pl.pallas_call(
         functools.partial(kda_intra_chunk_kernel, chunk_size=chunk_size, head_dim=D, scale=scale),
+        interpret=True,
         out_shape=[
             jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype), # u
             jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype), # w
@@ -258,7 +264,7 @@ def kda_intra_chunk_fwd(
         ],
         grid=grid,
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel","parallel")),
-    )(q_reshaped, k_reshaped, g_reshaped, beta_reshaped, v_reshaped, segment_ids_reshaped)
+    )(q_reshaped, k_reshaped, g_reshaped, beta_reshaped, v_reshaped, segment_ids_reshaped)# , segment_ids_reshaped
     
     return (
         u_reshaped.reshape(B, H, T, D),
