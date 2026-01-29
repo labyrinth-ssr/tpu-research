@@ -39,7 +39,10 @@ def solve_unit_lower_triangular(A, b):
                 correction = jax.lax.dot_general(
                     vec, mat,
                     (((1,), (0,)), ((), ())),
+<<<<<<< HEAD
                     precision=jax.lax.Precision.HIGHEST,
+=======
+>>>>>>> a1d2758
                     preferred_element_type=jnp.float32
                 ).squeeze(axis=0)
                 rows[j] = rows[j] - correction
@@ -56,7 +59,10 @@ def solve_unit_lower_triangular(A, b):
             update = jax.lax.dot_general(
                 A_rest, x_block,
                 (((1,), (0,)), ((), ())),
+<<<<<<< HEAD
                 precision=jax.lax.Precision.HIGHEST,
+=======
+>>>>>>> a1d2758
                 preferred_element_type=jnp.float32
             )
             x_rest = x_rest - update
@@ -72,7 +78,7 @@ def solve_unit_lower_triangular(A, b):
 
 def kda_intra_chunk_kernel(
     # Inputs (Ref)
-    q_ref, k_ref, g_ref, beta_ref, v_ref,
+    q_ref, k_ref, g_ref, beta_ref, v_ref, segment_ids_ref,
     # Outputs (Ref)
     u_out_ref, w_out_ref, qg_out_ref, kg_out_ref, Aqk_out_ref, Akk_inv_out_ref,
     # Config
@@ -80,6 +86,7 @@ def kda_intra_chunk_kernel(
     head_dim: int,
     scale: float,
 ):
+    dtype = q_ref.dtype
     # Load inputs into VMEM
     # q: (C, D), k: (C, D), g: (C, D), beta: (C, 1), v: (C, D)
     q = q_ref[0, 0, 0]
@@ -87,6 +94,7 @@ def kda_intra_chunk_kernel(
     g = g_ref[0, 0, 0]
     beta = beta_ref[0, 0, 0] # (C, 1)
     v = v_ref[0, 0, 0]
+    segment_ids = segment_ids_ref[0, 0, 0] 
 
     # 1. Compute A matrix using factorization for TPU MXU efficiency
     # Factorization: exp(g_i - g_j) = exp(g_i - g_ref) * exp(g_ref - g_j)
@@ -94,8 +102,13 @@ def kda_intra_chunk_kernel(
     
     # Pick reference g from the middle of the chunk
     g_ref_idx = chunk_size // 2
+<<<<<<< HEAD
     g_ref = g[g_ref_idx][None, :] # (1, D)
     g_centered = g.astype(jnp.float32) - g_ref.astype(jnp.float32) # (C, D)
+=======
+    g_ref_val = g[g_ref_idx][None, :] # (1, D)
+    g_centered = (g.astype(jnp.float32) - g_ref_val.astype(jnp.float32)) # (C, D)
+>>>>>>> a1d2758
 
     # Compute Q and K states for matrix multiplication
     # q_state = q * exp(g - g_ref)
@@ -112,28 +125,48 @@ def kda_intra_chunk_kernel(
     
     # Perform Matrix Multiplication (C, D) @ (D, C) -> (C, C)
     # This maps to TPU MXU instructions
-    
+    # 256x256xbf16 * 256x256xbf16 -> 256x256xf32
     # Akk = k_state_q @ k_state_k.T
     Akk_raw = jax.lax.dot_general(
         k_state_q.astype(k.dtype), 
         k_state_k.astype(k.dtype), 
         (((1,), (1,)), ((), ())),
+<<<<<<< HEAD
         precision=jax.lax.Precision.DEFAULT,
         preferred_element_type=jnp.float32
     )
+=======
+        # precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32
+    ).astype(dtype)
+    
+>>>>>>> a1d2758
     # Aqk = q_state @ k_state_k.T * scale
     Aqk_raw = jax.lax.dot_general(
         q_state, k_state_k,
         (((1,), (1,)), ((), ())),
+<<<<<<< HEAD
         precision=jax.lax.Precision.DEFAULT,
         preferred_element_type=jnp.float32
     ).astype(q.dtype)
+=======
+        # precision=jax.lax.Precision.HIGHEST
+        preferred_element_type=jnp.float32
+    ).astype(dtype)
+>>>>>>> a1d2758
     
     # Apply Mask and Beta
     idx = jnp.arange(chunk_size, dtype=jnp.int32)
-    mask = idx[:, None] > idx[None, :]
-    mask_qk = idx[:, None] >= idx[None, :] # Aqk usually includes diagonal
-    
+    causal_mask = idx[:, None] > idx[None, :]
+    causal_mask_qk = idx[:, None] >= idx[None, :] # Aqk usually includes diagonal
+
+    # Segment mask: i and j must belong to the same segment
+    # segment_ids: (C,)
+    segment_mask = segment_ids[:, None] == segment_ids[None, :]
+    # Combine masks
+    mask = causal_mask & segment_mask
+    mask_qk = causal_mask_qk & segment_mask
+
     # Akk[i, j] = Akk_raw[i, j] * beta[i] if i > j else 0
     Akk = jnp.where(mask, Akk_raw * beta, 0.0)
     
@@ -150,7 +183,6 @@ def kda_intra_chunk_kernel(
     target_w = k * jnp.exp(g) * beta
     identity = jnp.eye(chunk_size, dtype=v.dtype)
     
-    # Combine inputs along D axis to solve together: (C, 2D + C)
     combined_b = jnp.concatenate([v_scaled, target_w, identity], axis=-1)
     combined_x = solve_unit_lower_triangular(Akk, combined_b)
     
@@ -158,6 +190,7 @@ def kda_intra_chunk_kernel(
     w = combined_x[:, head_dim:2*head_dim]
     Akk_inv = combined_x[:, 2*head_dim:]
     
+<<<<<<< HEAD
     # Store outputs
     u_out_ref[0, 0, 0] = u.astype(u_out_ref.dtype)
     w_out_ref[0, 0, 0] = w.astype(w_out_ref.dtype)
@@ -167,12 +200,15 @@ def kda_intra_chunk_kernel(
     # q_state = q * exp(g - g_ref)
     # So qg = q_state * exp(g_ref)
     
+=======
+>>>>>>> a1d2758
     qg = q * jnp.exp(g)
     
-    # kg = k * exp(g_last - g)
     g_last = g[chunk_size-1][None, :]
     kg = k * jnp.exp(g_last - g)
 
+    u_out_ref[0, 0, 0] = u.astype(u_out_ref.dtype)
+    w_out_ref[0, 0, 0] = w.astype(w_out_ref.dtype)
     qg_out_ref[0, 0, 0] = qg
     kg_out_ref[0, 0, 0] = kg
     Aqk_out_ref[0, 0, 0] = Aqk
@@ -185,6 +221,7 @@ def kda_intra_chunk_fwd(
     g: jax.Array,
     beta: jax.Array,
     v: jax.Array,
+    segment_ids: jax.Array = None,
     scale: float = 1.0,
     chunk_size: int = 128
 ):
@@ -197,6 +234,8 @@ def kda_intra_chunk_fwd(
         g: (B, H, T, D) Cumulative Sum of Log-Decay
         beta: (B, H, T) Beta
         v: (B, H, T, D) Value
+        segment_ids: (B, T) Segment IDs for variable length sequences. 
+                     Tokens with different IDs will not attend to each other.
         scale: Attention scale factor
         chunk_size: Block size for Pallas kernel.
         
@@ -211,6 +250,11 @@ def kda_intra_chunk_fwd(
     B, H, T, D = k.shape
     assert T % chunk_size == 0, "Sequence length must be divisible by chunk_size"
     num_chunks = T // chunk_size
+
+    # Handle segment_ids
+    if segment_ids is None:
+        # Default: all tokens belong to segment 0 (or distinct segments per batch, doesn't matter since B dim is separated)
+        segment_ids = jnp.zeros((B, T), dtype=jnp.int32)
     
     # Reshape to expose chunks: (B, H, num_chunks, chunk_size, D)
     q_reshaped = q.reshape(B, H, num_chunks, chunk_size, D)
@@ -218,6 +262,7 @@ def kda_intra_chunk_fwd(
     g_reshaped = g.reshape(B, H, num_chunks, chunk_size, D)
     beta_reshaped = beta.reshape(B, H, num_chunks, chunk_size, 1)
     v_reshaped = v.reshape(B, H, num_chunks, chunk_size, D)
+    segment_ids_reshaped = segment_ids.reshape(B, 1, num_chunks, chunk_size)
     
     grid = (B, H, num_chunks)
     
@@ -238,6 +283,7 @@ def kda_intra_chunk_fwd(
             pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # g
             pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, 1)), # beta
             pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # v
+            pl.BlockSpec(index_map=lambda i, j, l: (i, 0, l, 0), block_shape=(1, 1, 1, chunk_size)),       # segment_ids
         ],
         out_specs=[
             pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # u
@@ -249,7 +295,7 @@ def kda_intra_chunk_fwd(
         ],
         grid=grid,
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel","parallel")),
-    )(q_reshaped, k_reshaped, g_reshaped, beta_reshaped, v_reshaped)
+    )(q_reshaped, k_reshaped, g_reshaped, beta_reshaped, v_reshaped, segment_ids_reshaped)
     
     return (
         u_reshaped.reshape(B, H, T, D),

@@ -34,8 +34,7 @@ class TestKDAIntraChunk(unittest.TestCase):
 
         B, H, T, D = 1, 4, 128, 64
         chunk_size = 64
-        dtype = torch.float32
-        
+        dtype = torch.bfloat16        
         if torch.cuda.is_available():
             device = torch.device('cuda')
         else:
@@ -69,11 +68,11 @@ class TestKDAIntraChunk(unittest.TestCase):
         # Pallas implementation in `pallas_kda.py` takes (B, H, T, D).
         # Our tensors are (B, T, H, D). Need permute.
         
-        q_jax = jnp.array(q.detach().cpu().permute(0, 2, 1, 3).numpy())
-        k_jax = jnp.array(k.detach().cpu().permute(0, 2, 1, 3).numpy())
-        g_jax = jnp.array(g.detach().cpu().permute(0, 2, 1, 3).numpy())
-        beta_jax = jnp.array(beta.detach().cpu().permute(0, 2, 1).numpy())
-        v_jax = jnp.array(v.detach().cpu().permute(0, 2, 1, 3).numpy())
+        q_jax = jnp.array(q.detach().cpu().float().permute(0, 2, 1, 3).numpy())
+        k_jax = jnp.array(k.detach().cpu().float().permute(0, 2, 1, 3).numpy())
+        g_jax = jnp.array(g.detach().cpu().float().permute(0, 2, 1, 3).numpy())
+        beta_jax = jnp.array(beta.detach().cpu().float().permute(0, 2, 1).numpy())
+        v_jax = jnp.array(v.detach().cpu().float().permute(0, 2, 1, 3).numpy())
         # Pallas returns u, w
         u_jax, w_jax, qg_jax, kg_jax, Aqk_jax, Akk_jax = pallas_intra(q_jax, k_jax, g_jax, beta_jax, v_jax, chunk_size=chunk_size)
         print("A max:", Akk_jax.max(), "min:", Akk_jax.min())
@@ -96,8 +95,8 @@ class TestKDAIntraChunk(unittest.TestCase):
             # Pallas: `jnp.exp(safe_g_diff)` -> Natural exponential.
             # Fla: `exp2(b_g - b_gn)` -> Base-2 exponential.
             # So pass g * RCP_LN2 to Fla.
-            RCP_LN2 = 1.44269504
-            g_fla = g * RCP_LN2
+            # RCP_LN2 = 1.44269504
+            # g_fla = g * RCP_LN2
             
             # Scale: Pallas kernel doesn't seem to apply a global scale factor to A?
             # A_raw = sum(k*k*exp(g)). A = A_raw * beta.
@@ -109,7 +108,7 @@ class TestKDAIntraChunk(unittest.TestCase):
                 q=q, 
                 k=k, 
                 v=v, 
-                gk=g_fla,
+                gk=g,
                 beta=beta, 
                 scale=scale, 
                 chunk_size=chunk_size,
@@ -118,18 +117,18 @@ class TestKDAIntraChunk(unittest.TestCase):
             )
             
             # Fla returns (B, T, H, D). Permute to compare with Pallas (B, H, T, D).
-            u_fla_np = u_fla.detach().cpu().permute(0, 2, 1, 3).numpy()
-            w_fla_np = w_fla.detach().cpu().permute(0, 2, 1, 3).numpy()
-            qg_fla_np = qg_fla.detach().cpu().permute(0, 2, 1, 3).numpy()
-            kg_fla_np = kg_fla.detach().cpu().permute(0, 2, 1, 3).numpy()
+            u_fla_np = u_fla.detach().cpu().float().permute(0, 2, 1, 3).numpy()
+            w_fla_np = w_fla.detach().cpu().float().permute(0, 2, 1, 3).numpy()
+            qg_fla_np = qg_fla.detach().cpu().float().permute(0, 2, 1, 3).numpy()
+            kg_fla_np = kg_fla.detach().cpu().float().permute(0, 2, 1, 3).numpy()
             
             # Reshape Aqk/Akk from (B, T, H, BT) to (B, H, NC, BT, BT)
             # T = NC * BT
             B_sz, T_sz, H_sz, BT_sz = Aqk_fla.shape
             NC_sz = T_sz // BT_sz
             
-            Aqk_fla_np = Aqk_fla.view(B_sz, NC_sz, BT_sz, H_sz, BT_sz).permute(0, 3, 1, 2, 4).detach().cpu().numpy()
-            Akkk_fla_np = Akkk_fla.view(B_sz, NC_sz, BT_sz, H_sz, BT_sz).permute(0, 3, 1, 2, 4).detach().cpu().numpy()
+            Aqk_fla_np = Aqk_fla.view(B_sz, NC_sz, BT_sz, H_sz, BT_sz).permute(0, 3, 1, 2, 4).detach().cpu().float().numpy()
+            Akkk_fla_np = Akkk_fla.view(B_sz, NC_sz, BT_sz, H_sz, BT_sz).permute(0, 3, 1, 2, 4).detach().cpu().float().numpy()
             
             # Check for NaNs
             if np.isnan(u_jax).any(): print("NaN in Pallas Output!")
