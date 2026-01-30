@@ -16,7 +16,6 @@ dependencies = [
     "transformers",
     "einops",
     "pytest",
-    "torch",
     "transformers",
     "einops",
 ]

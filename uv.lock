@@ -1863,8 +1863,6 @@ dependencies = [
     { name = "numpy" },
     { name = "optax" },
     { name = "pytest" },
-    { name = "torch", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or sys_platform != 'linux'" },
-    { name = "torch", version = "2.9.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and sys_platform == 'linux'" },
     { name = "transformers" },
 ]
 
@@ -1892,7 +1890,6 @@ requires-dist = [
     { name = "numpy" },
     { name = "optax" },
     { name = "pytest" },
-    { name = "torch" },
     { name = "torch", marker = "extra == 'gpu'" },
     { name = "transformers" },
     { name = "triton", marker = "extra == 'gpu'", specifier = ">=3.2.0" },
