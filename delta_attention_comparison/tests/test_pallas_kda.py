@@ -196,7 +196,7 @@ class TestPallasKDA(unittest.TestCase):
         # Config
         B, H, T, D = 1, 2, 256, 128
         chunk_size = 128
-        dtype = jnp.float32 # Use float32 for gradient checking to avoid precision issues
+        dtype = jnp.bfloat16 # Use float32 for gradient checking to avoid precision issues
         scale = 1.0
         
         # Seeds
