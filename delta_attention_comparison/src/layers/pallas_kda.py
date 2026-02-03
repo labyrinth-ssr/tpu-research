@@ -79,8 +79,6 @@ def kda_intra_chunk_kernel(
     scale: float,
 ):
     dtype = q_ref.dtype
-    # Load inputs into VMEM
-    # q: (C, D), k: (C, D), g: (C, D), beta: (C, 1), v: (C, D)
     q = q_ref[0, 0, 0]
     k = k_ref[0, 0, 0]
     g = g_ref[0, 0, 0]
@@ -88,7 +86,7 @@ def kda_intra_chunk_kernel(
     v = v_ref[0, 0, 0]
     segment_ids = segment_ids_ref[0, 0, 0, :, 0] 
 
-    # 1. Compute A matrix using factorization for TPU MXU efficiency
+    # ompute A matrix using factorization for TPU MXU efficiency
     # Factorization: exp2(g_i - g_j) = exp2(g_i - g_ref) * exp2(g_ref - g_j)
     # We choose g_ref to be the middle of the chunk for numerical stability (Safe Gate)
     
@@ -97,23 +95,10 @@ def kda_intra_chunk_kernel(
     g_ref_val = g[g_ref_idx][None, :] # (1, D)
     g_centered = (g.astype(jnp.float32) - g_ref_val.astype(jnp.float32)) # (C, D)
 
-    # Compute Q and K states for matrix multiplication
-    # q_state = q * exp2(g - g_ref)
-    # k_state = k * exp2(g_ref - g)
     q_state = q * jnp.exp2(g_centered).astype(q.dtype)
-    
-    # Re-use k_state logic for both Aqk and Akk
-    # For Akk: K * exp2(g - g_ref) vs K * exp2(g_ref - g) logic
-    # In original kda: A_ij = k_i * k_j * exp2(g_i - g_j)
-    # = (k_i * exp2(g_i - g_ref)) * (k_j * exp2(g_ref - g_j))
-    # Let's call them k_state_q (acts like query) and k_state_k (acts like key)
     k_state_q = k * jnp.exp2(g_centered)
     k_state_k = k * jnp.exp2(-g_centered)
     
-    # Perform Matrix Multiplication (C, D) @ (D, C) -> (C, C)
-    # This maps to TPU MXU instructions
-    # 256x256xbf16 * 256x256xbf16 -> 256x256xf32
-    # Akk = k_state_q @ k_state_k.T
     Akk_raw = jax.lax.dot_general(
         k_state_q.astype(k.dtype), 
         k_state_k.astype(k.dtype), 
@@ -122,7 +107,6 @@ def kda_intra_chunk_kernel(
         preferred_element_type=jnp.float32
     ).astype(dtype)
     
-    # Aqk = q_state @ k_state_k.T * scale
     Aqk_raw = jax.lax.dot_general(
         q_state, k_state_k,
         (((1,), (1,)), ((), ())),
@@ -130,22 +114,16 @@ def kda_intra_chunk_kernel(
         preferred_element_type=jnp.float32
     ).astype(dtype)
     
-    # Apply Mask and Beta
     idx = jnp.arange(chunk_size, dtype=jnp.int32)
     causal_mask = idx[:, None] > idx[None, :]
     causal_mask_qk = idx[:, None] >= idx[None, :] # Aqk usually includes diagonal
 
     # Segment mask: i and j must belong to the same segment
-    # segment_ids: (C,)
     segment_mask = segment_ids[:, None] == segment_ids[None, :]
-    # Combine masks
     mask = causal_mask & segment_mask
     mask_qk = causal_mask_qk & segment_mask
 
-    # Akk[i, j] = Akk_raw[i, j] * beta[i] if i > j else 0
     Akk = jnp.where(mask, Akk_raw * beta, 0.0)
-    
-    # Aqk[i, j] = Aqk_raw[i, j] * scale if i >= j else 0
     Aqk = jnp.where(mask_qk, Aqk_raw * scale, 0.0)
 
     v_scaled = v * beta
@@ -287,30 +265,13 @@ def kda_intra_chunk_bwd_kernel(
     dAkk = dAkk_ref[0, 0, 0]
 
     # Recompute states (Forward Pass Logic)
-    g_ref_idx = 0
+    g_ref_idx = chunk_size // 2
     g_ref_val = g[g_ref_idx][None, :]
     g_centered = (g.astype(jnp.float32) - g_ref_val.astype(jnp.float32))
     
     q_state = q * jnp.exp2(g_centered).astype(q.dtype)
     k_state_q = k * jnp.exp2(g_centered).astype(k.dtype)
     k_state_k = k * jnp.exp2(-g_centered).astype(k.dtype)
-
-    # g_diff = jnp.expand_dims(g, -2) - jnp.expand_dims(g, -3)
-    # decay_full = jnp.exp2(g_diff)
-    
-    # idx = jnp.arange(chunk_size)
-    
-    # # [STRICT MASK] Stage 2: i > j (Strict Lower)
-    # # Matches PyTorch triu(0) masked_fill 0
-    # mask = idx[:, None] >= idx[None, :]
-    # decay_mask = jnp.where(jnp.expand_dims(mask, -1), decay_full, 0.0)
-    # # k_state_k_debug = jnp.expand_dims(k, axis=-3)
-
-
-    # gk = jnp.exp2(-g_centered)
-    # jax.debug.print("[pallas]k shape:{shape}, max: {max}, min: {min}",shape=k.shape, max=jnp.max(k), min=jnp.min(k))
-    # jax.debug.print("[pallas]gk shape:{shape},  max: {max}, min: {min}, total: {total}", shape=decay_mask.shape, max=jnp.max(decay_mask), min=jnp.min(decay_mask), total=decay_mask)
-    # jax.debug.print("[pallas]k_state_k max: {max}, min: {min}", max=jnp.max(k_state_k_debug), min=jnp.min(k_state_k_debug))
 
     # Recompute masks
     idx = jnp.arange(chunk_size, dtype=jnp.int32)
@@ -321,12 +282,9 @@ def kda_intra_chunk_bwd_kernel(
     mask_akk = causal_mask & segment_mask
     mask_aqk = causal_mask_qk & segment_mask
     
-    # Mask Gradients
     dAqk_masked = jnp.where(mask_aqk, dAqk, 0.0) * scale
     dAkk_masked = jnp.where(mask_akk, dAkk, 0.0)
-    # jax.debug.print("[pallas]dAkk_masked, total{total} max: {max}, min: {min}",total = dAkk_masked, max=jnp.max(dAkk_masked), min=jnp.min(dAkk_masked))
     
-    # Recompute Akk_raw for dbeta (Akk = Akk_raw * beta)
     Akk_raw = jax.lax.dot_general(
         k_state_q,
         k_state_k,
@@ -336,19 +294,8 @@ def kda_intra_chunk_bwd_kernel(
     )
     dbeta = jnp.sum(dAkk_masked * Akk_raw, axis=1, keepdims=True).astype(beta.dtype)
     
-    # dAkk_raw contribution from dAkk (masked)
     dAkk_raw = dAkk_masked * beta
 
-    # jax.debug.print("[pallas] beta max: {max}, min: {min}", max=jnp.max(beta), min=jnp.min(beta))
-
-    # jax.debug.print("[pallas]dAqk_masked max: {max}, min: {min}", max=jnp.max(dAqk_masked), min=jnp.min(dAqk_masked))
-    # jax.debug.print("[pallas]dAkk_raw max: {max}, min: {min}", max=jnp.max(dAkk_raw), min=jnp.min(dAkk_raw))
-
-    # jax.debug.print("[pallas]dAqk_masked max: {max}, min: {min}", max=jnp.max(dAqk_masked), min=jnp.min(dAqk_masked))
-    # jax.debug.print("[pallas]k max: {max}, min: {min}", max=jnp.max(k), min=jnp.min(k))
-    
-    # Gradients w.r.t states
-    # dq_state = dAqk_masked @ k_state_k
     dq_state = jax.lax.dot_general(
         dAqk_masked, k_state_k,
         (((1,), (0,)), ((), ())), # (C, C) @ (C, D) -> (C, D)
@@ -356,8 +303,6 @@ def kda_intra_chunk_bwd_kernel(
         preferred_element_type=jnp.float32
     )
 
-    # jax.debug.print("dq_state max: {max}, min: {min}", max=jnp.max(dq_state), min=jnp.min(dq_state))
-    
     # dk_state_k part 1 from Aqk: dAqk_masked.T @ q_state
     dk_state_k_1 = jax.lax.dot_general(
         dAqk_masked, q_state,
@@ -366,52 +311,15 @@ def kda_intra_chunk_bwd_kernel(
         preferred_element_type=jnp.float32
     )
 
-    # C = 64
-    # D = 64
-    # dk_state_q_accum = jnp.zeros((C, D), dtype=jnp.float32)                                                                              
-                                                                                                                                         
-    # def body_fun(j, accum):
-    #     # j is the scalar loop index (0 to C-1)
-    #     # 1. Get dAkk column j: shape (C,) -> (C, 1) for broadcasting
-    #     # dAkk[:, j]
-    #     dakk_col = dAkk_masked[:, j][:, None] # (C, 1) representing i-axis
-    #     # 2. Get k row j: shape (D,) -> (1, D) for broadcasting
-    #     # k[j, :]
-    #     k_row = k[j, :][None, :] # (1, D) representing k-axis
-    #     # 3. Get decay slice j: shape (C, D)
-    #     # decay[:, j, :]
-    #     decay_slice = decay_mask[:, j, :] # (C, D) representing (i, k) axes
-    #     # 4. Compute term for this j
-    #     # (C, 1) * (1, D) * (C, D) -> (C, D) element-wise
-    #     term = dakk_col * k_row * decay_slice
-    #     # Debug print inside loop (optional)
-    #     jax.debug.print("[pallas] Loop j={j}, dakk_col max: {dakk_max}, k_row max: {k_max}, decay_slice total: {decay_total}, term max: {term_max}, term total:{term_total}, term_shape: {term_shape}", j=j, dakk_max=jnp.max(dakk_col), k_max=jnp.max(k_row), decay_total=decay_slice, term_max=jnp.max(term), term_total=term, term_shape=term.shape)
-    #     # jax.debug.print("j={j}, term max={max}", j=j, max=jnp.max(term))
-    #     return accum + term
-                                                                                                                                         
-    # # Run loop from j=0 to C                                                                                                             
-    # dk_state_q_debug = jax.lax.fori_loop(0, C, body_fun, dk_state_q_accum)
-
-    # dk_state_q_before_beta = jnp.einsum('ij, jk, ijk -> ik', dAkk_masked, k, decay_mask)
-    # dk_state_q = dk_state_q_before_beta * beta
-    # dk_state_q from Akk: dAkk_raw @ k_state_k
     dk_state_q = jax.lax.dot_general(
         dAkk_raw, k_state_k,
         (((1,), (0,)), ((), ())),
         precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32
     )
-    # Gradients w.r.t original inputs
     exp_g = jnp.exp2(g_centered).astype(jnp.float32)
     exp_neg_g = jnp.exp2(-g_centered).astype(jnp.float32)
 
-    # max_idx = jnp.argmax(dk_state_q)
-    # max_idx_tuple = jnp.unravel_index(max_idx, (dk_state_q).shape)
-    # jax.debug.print("[pallas] dk_state_q_before_beta shape:{shape}, max_idx: {max_idx}, max_val: {max_val}, min_val: {min_val}, total: {total}",shape=dk_state_q_before_beta.shape, max_idx=max_idx_tuple, max_val=jnp.max(dk_state_q_before_beta), min_val=jnp.min(dk_state_q_before_beta), total=dk_state_q_before_beta)
-    jax.debug.print("[pallas] dk2 max: {max}, min: {min}", max=jnp.max(dk_state_q* exp_g), min=jnp.min(dk_state_q* exp_g))
-
-    
-    # dk_state_k part 2 from Akk: dAkk_raw.T @ k_state_q
     dk_state_k_2 = jax.lax.dot_general(
         dAkk_raw, k_state_q,
         (((0,), (0,)), ((), ())),
@@ -420,27 +328,19 @@ def kda_intra_chunk_bwd_kernel(
     )
     
     dk_state_k = dk_state_k_1 + dk_state_k_2
-    
     dq = (dq_state * exp_g).astype(dtype)
-
     dk = (dk_state_q * exp_g + dk_state_k * exp_neg_g).astype(dtype)
-    # jax.debug.print("dk_state_k max: {max}, min: {min}", max=jnp.max(dk_state_k*exp_neg_g), min=jnp.min(dk_state_k*exp_neg_g))
-    
-    # dg calculation
-    dg_c = (dq_state * q_state + dk_state_q * k_state_q - dk_state_k * k_state_k) * jnp.log(2.0)
+    dg_c = (dq_state * q_state + dk_state_q * k_state_q - dk_state_k * k_state_k) 
     
     # Handle g_ref gradient subtraction
     dg_ref_grad = -jnp.sum(dg_c, axis=0, keepdims=False) # (D,)
     dg = dg_c
     
-    # Replace scatter-add with mask-based addition
     idx_range = jnp.arange(chunk_size, dtype=jnp.int32)
     mask_ref_bool = (idx_range == g_ref_idx)
-    # Convert to float BEFORE reshaping to avoid vector<...xi1> reshape issues in Mosaic
     mask_ref = jnp.reshape(mask_ref_bool.astype(dg.dtype), (chunk_size, 1))
     dg = dg + mask_ref * dg_ref_grad[None, :].astype(dg.dtype)
     
-    # Store outputs
     dq_ref[0, 0, 0] = dq
     dk_ref[0, 0, 0] = dk
     dg_ref[0, 0, 0] = dg.astype(dtype)
