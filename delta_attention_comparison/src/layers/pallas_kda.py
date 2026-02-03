@@ -254,7 +254,6 @@ def kda_intra_chunk_bwd_kernel(
     scale: float,
 ):
     dtype = q_ref.dtype
-    # Load inputs
     q = q_ref[0, 0, 0]
     k = k_ref[0, 0, 0]
     g = g_ref[0, 0, 0]
@@ -267,7 +266,7 @@ def kda_intra_chunk_bwd_kernel(
     # Recompute states (Forward Pass Logic)
     g_ref_idx = chunk_size // 2
     g_ref_val = g[g_ref_idx][None, :]
-    g_centered = (g.astype(jnp.float32) - g_ref_val.astype(jnp.float32))
+    g_centered = g.astype(jnp.float32) - g_ref_val.astype(jnp.float32)
     
     q_state = q * jnp.exp2(g_centered).astype(q.dtype)
     k_state_q = k * jnp.exp2(g_centered).astype(k.dtype)
@@ -289,7 +288,7 @@ def kda_intra_chunk_bwd_kernel(
         k_state_q,
         k_state_k,
         (((1,), (1,)), ((), ())),
-        precision=jax.lax.Precision.HIGHEST,
+        # precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32
     )
     dbeta = jnp.sum(dAkk_masked * Akk_raw, axis=1, keepdims=True).astype(beta.dtype)
@@ -299,7 +298,7 @@ def kda_intra_chunk_bwd_kernel(
     dq_state = jax.lax.dot_general(
         dAqk_masked, k_state_k,
         (((1,), (0,)), ((), ())), # (C, C) @ (C, D) -> (C, D)
-        precision=jax.lax.Precision.HIGHEST,
+        # precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32
     )
 
@@ -307,23 +306,23 @@ def kda_intra_chunk_bwd_kernel(
     dk_state_k_1 = jax.lax.dot_general(
         dAqk_masked, q_state,
         (((0,), (0,)), ((), ())), # (C, C).T @ (C, D) -> (C, D)
-        precision=jax.lax.Precision.HIGHEST,
+        # precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32
     )
 
     dk_state_q = jax.lax.dot_general(
         dAkk_raw, k_state_k,
         (((1,), (0,)), ((), ())),
-        precision=jax.lax.Precision.HIGHEST,
+        # precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32
     )
-    exp_g = jnp.exp2(g_centered).astype(jnp.float32)
-    exp_neg_g = jnp.exp2(-g_centered).astype(jnp.float32)
+    exp_g = jnp.exp2(g_centered).astype(dtype)
+    exp_neg_g = jnp.exp2(-g_centered).astype(dtype)
 
     dk_state_k_2 = jax.lax.dot_general(
         dAkk_raw, k_state_q,
         (((0,), (0,)), ((), ())),
-        precision=jax.lax.Precision.HIGHEST,
+        # precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32
     )
     
@@ -373,8 +372,6 @@ def kda_intra_chunk_bwd(
     g_reshaped = g.reshape(B, H, num_chunks, chunk_size, D)
     beta_reshaped = beta.reshape(B, H, num_chunks, chunk_size, 1)
     segment_ids_reshaped = segment_ids.reshape(B, 1, num_chunks, chunk_size, 1)
-    
-    # dAqk, dAkk are (B, H, num_chunks, chunk_size, chunk_size)
     
     grid = (B, H, num_chunks)
     
