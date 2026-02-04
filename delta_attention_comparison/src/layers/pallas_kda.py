@@ -39,6 +39,7 @@ def solve_unit_lower_triangular(A, b):
                 correction = jax.lax.dot_general(
                     vec, mat,
                     (((1,), (0,)), ((), ())),
+                    precision=jax.lax.Precision.HIGHEST,
                     preferred_element_type=jnp.float32
                 ).squeeze(axis=0)
                 rows[j] = rows[j] - correction
@@ -55,6 +56,7 @@ def solve_unit_lower_triangular(A, b):
             update = jax.lax.dot_general(
                 A_rest, x_block,
                 (((1,), (0,)), ((), ())),
+                precision=jax.lax.Precision.HIGHEST,
                 preferred_element_type=jnp.float32
             )
             x_rest = x_rest - update
@@ -103,14 +105,14 @@ def kda_intra_chunk_kernel(
         k_state_q.astype(k.dtype), 
         k_state_k.astype(k.dtype), 
         (((1,), (1,)), ((), ())),
-        # precision=jax.lax.Precision.HIGHEST,
+        precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32
     ).astype(dtype)
     
     Aqk_raw = jax.lax.dot_general(
         q_state, k_state_k,
         (((1,), (1,)), ((), ())),
-        # precision=jax.lax.Precision.HIGHEST
+        precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32
     ).astype(dtype)
     
@@ -183,13 +185,28 @@ def kda_intra_chunk_fwd(
         Akk_inv: (B, H, num_chunks, chunk_size, chunk_size)
     """
     B, H, T, D = k.shape
-    assert T % chunk_size == 0, "Sequence length must be divisible by chunk_size"
-    num_chunks = T // chunk_size
+    
+    # Handle padding if T is not divisible by chunk_size
+    remainder = T % chunk_size
+    pad_len = (chunk_size - remainder) % chunk_size
+    
+    if pad_len > 0:
+        q = jnp.pad(q, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
+        k = jnp.pad(k, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
+        # Pad g with edge mode to avoid large jumps in exp2(g - g_ref)
+        g = jnp.pad(g, ((0, 0), (0, 0), (0, pad_len), (0, 0)), mode='edge')
+        beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad_len)))
+        v = jnp.pad(v, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
+        if segment_ids is not None:
+            segment_ids = jnp.pad(segment_ids, ((0, 0), (0, pad_len)))
+    
+    padded_T = T + pad_len
+    num_chunks = padded_T // chunk_size
 
     # Handle segment_ids
     if segment_ids is None:
         # Default: all tokens belong to segment 0 (or distinct segments per batch, doesn't matter since B dim is separated)
-        segment_ids = jnp.zeros((B, T), dtype=jnp.int32)
+        segment_ids = jnp.zeros((B, padded_T), dtype=jnp.int32)
     
     # Reshape to expose chunks: (B, H, num_chunks, chunk_size, D)
     q_reshaped = q.reshape(B, H, num_chunks, chunk_size, D)
@@ -233,11 +250,22 @@ def kda_intra_chunk_fwd(
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel","parallel")),
     )(q_reshaped, k_reshaped, g_reshaped, beta_reshaped, v_reshaped, segment_ids_reshaped)
     
+    u = u_reshaped.reshape(B, H, padded_T, D)
+    w = w_reshaped.reshape(B, H, padded_T, D)
+    qg = qg_reshaped.reshape(B, H, padded_T, D)
+    kg = kg_reshaped.reshape(B, H, padded_T, D)
+
+    if pad_len > 0:
+        u = u[:, :, :T, :]
+        w = w[:, :, :T, :]
+        qg = qg[:, :, :T, :]
+        kg = kg[:, :, :T, :]
+
     return (
-        u_reshaped.reshape(B, H, T, D),
-        w_reshaped.reshape(B, H, T, D),
-        qg_reshaped.reshape(B, H, T, D),
-        kg_reshaped.reshape(B, H, T, D),
+        u,
+        w,
+        qg,
+        kg,
         Aqk_reshaped,
         Akk_inv_reshaped
     )
@@ -361,11 +389,25 @@ def kda_intra_chunk_bwd(
     Pallas implementation of KDA Intra-Chunk Backward Pass.
     """
     B, H, T, D = k.shape
-    assert T % chunk_size == 0
-    num_chunks = T // chunk_size
+    
+    # Handle padding if T is not divisible by chunk_size
+    remainder = T % chunk_size
+    pad_len = (chunk_size - remainder) % chunk_size
+    
+    if pad_len > 0:
+        q = jnp.pad(q, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
+        k = jnp.pad(k, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
+        # Pad g with edge mode
+        g = jnp.pad(g, ((0, 0), (0, 0), (0, pad_len), (0, 0)), mode='edge')
+        beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad_len)))
+        if segment_ids is not None:
+            segment_ids = jnp.pad(segment_ids, ((0, 0), (0, pad_len)))
+
+    padded_T = T + pad_len
+    num_chunks = padded_T // chunk_size
 
     if segment_ids is None:
-        segment_ids = jnp.zeros((B, T), dtype=jnp.int32)
+        segment_ids = jnp.zeros((B, padded_T), dtype=jnp.int32)
     
     q_reshaped = q.reshape(B, H, num_chunks, chunk_size, D)
     k_reshaped = k.reshape(B, H, num_chunks, chunk_size, D)
@@ -403,9 +445,20 @@ def kda_intra_chunk_bwd(
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel","parallel")),
     )(q_reshaped, k_reshaped, g_reshaped, beta_reshaped, segment_ids_reshaped, dAqk, dAkk)
     
+    dq = dq_reshaped.reshape(B, H, padded_T, D)
+    dk = dk_reshaped.reshape(B, H, padded_T, D)
+    dg = dg_reshaped.reshape(B, H, padded_T, D)
+    dbeta = dbeta_reshaped.reshape(B, H, padded_T)
+    
+    if pad_len > 0:
+        dq = dq[:, :, :T, :]
+        dk = dk[:, :, :T, :]
+        dg = dg[:, :, :T, :]
+        dbeta = dbeta[:, :, :T]
+
     return (
-        dq_reshaped.reshape(B, H, T, D),
-        dk_reshaped.reshape(B, H, T, D),
-        dg_reshaped.reshape(B, H, T, D),
-        dbeta_reshaped.reshape(B, H, T)
+        dq,
+        dk,
+        dg,
+        dbeta
     )
