@@ -47,7 +47,7 @@ class TestKDAIntraChunk(unittest.TestCase):
         q = F.normalize(q, p=2, dim=-1)
         k = F.normalize(k, p=2, dim=-1)
 
-        safe_gate = False
+        safe_gate = True
         
         v = torch.randn(B, T, H, D, dtype=dtype, device=device)
         
