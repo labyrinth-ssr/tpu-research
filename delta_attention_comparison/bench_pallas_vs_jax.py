@@ -124,59 +124,66 @@ def main():
 
     # Configurations
     H = 16
-    D = 128
-    CHUNK_SIZE = 256
+    D = 2048
+    # CHUNK_SIZE = 256
     DTYPE = jnp.bfloat16
     
+    chunk_size_scan = [16,32,64,128,256,512,1024]
+    d_scan = [2048]
+    # 16,32,64,128,256,512,1024, 
     # Batch sizes and Sequence lengths to test
     configs = [
         # (Batch, SeqLen)
-        (1, 1024),
-        (1, 4096),
-        (2, 4096),
-        (4, 4096),
-        (8, 4096),
-        (1, 8192),
-        (1, 16384),
-        (1, 32768), 
+        (4, 8192),
+        # (1, 4096),
+        # (2, 4096),
+        # (4, 4096),
+        # (8, 4096),
+        # (1, 8192),
+        # (1, 16384),
+        # (1, 32768),
     ]
-
-    print(f"{'B':<4} | {'T':<6} | {'H':<3} | {'D':<3} | {'JAX (ms)':<10} | {'Pallas (ms)':<12} | {'Speedup':<8}")
+    print(f"{'B':<4} | {'T':<6} | {'H':<3} | {'D':<4} | {'BC':<4}| {'JAX (ms)':<10} | {'Pallas (ms)':<12} | {'Speedup':<8}")
     print("-" * 75)
 
-    for B, T in configs:
-        # Generate Inputs
-        key = jax.random.PRNGKey(0)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
-        
-        q = jax.random.normal(k1, (B, H, T, D), dtype=DTYPE)
-        k = jax.random.normal(k1, (B, H, T, D), dtype=DTYPE)
-        g_raw = jax.nn.log_sigmoid(jax.random.normal(k2, (B, H, T, D), dtype=DTYPE))
-        # Ensure g is cumsum-ed as expected by kernel
-        g_reshaped = g_raw.reshape(B, H, T // CHUNK_SIZE, CHUNK_SIZE, D)
-        g = jnp.cumsum(g_reshaped, axis=-2).reshape(B, H, T, D)
-        
-        beta = jax.nn.sigmoid(jax.random.normal(k3, (B, H, T), dtype=DTYPE))
-        v = jax.random.normal(k4, (B, H, T, D), dtype=DTYPE)
-        
-        args = (k, g, beta, v, CHUNK_SIZE)
-        args_pallas = (q,k, g, beta, v, CHUNK_SIZE)
+    for CHUNK_SIZE in chunk_size_scan:
+        for D in d_scan:
+            for B, T in configs:
+                # Generate Inputs
+                key = jax.random.PRNGKey(0)
+                k1, k2, k3, k4 = jax.random.split(key, 4)
+                
+                q = jax.random.normal(k1, (B, H, T, D), dtype=DTYPE)
+                k = jax.random.normal(k1, (B, H, T, D), dtype=DTYPE)
+                g_raw = jax.nn.log_sigmoid(jax.random.normal(k2, (B, H, T, D), dtype=DTYPE))
+                # Ensure g is cumsum-ed as expected by kernel
+                g_reshaped = g_raw.reshape(B, H, T // CHUNK_SIZE, CHUNK_SIZE, D)
+                g = jnp.cumsum(g_reshaped, axis=-2).reshape(B, H, T, D)
+                
+                beta = jax.nn.sigmoid(jax.random.normal(k3, (B, H, T), dtype=DTYPE))
+                v = jax.random.normal(k4, (B, H, T, D), dtype=DTYPE)
 
-        try:
-            # Benchmark JAX
-            t_jax = benchmark_fn("JAX", jax_intra_chunk_fwd, args)
-            
-            # Benchmark Pallas
-            # Drop A (3rd output) to match JAX signature
-            pallas_wrapper = lambda *a: kda_intra_chunk_fwd(*a)[:2]
-            t_pallas = benchmark_fn("Pallas", pallas_wrapper, args_pallas)
-            
-            speedup = t_jax / t_pallas
-            print(f"{B:<4} | {T:<6} | {H:<3} | {D:<3} | {t_jax:<10.3f} | {t_pallas:<12.3f} | {speedup:<8.2f}x")
-            
-        except Exception as e:
+                segment_ids = None
+                scale = 1.0
+                
+                args = (k, g, beta, v, CHUNK_SIZE)
+                args_pallas = (q,k, g, beta, v, segment_ids, scale, CHUNK_SIZE)
 
-            print(f"{B:<4} | {T:<6} | {H:<3} | {D:<3} | {'ERROR':<10} | {'ERROR':<12} | {str(e)}")
+                try:
+                    # Benchmark JAX
+                    t_jax = benchmark_fn("JAX", jax_intra_chunk_fwd, args)
+                    
+                    # Benchmark Pallas
+                    # Drop A (3rd output) to match JAX signature
+                    pallas_wrapper = lambda *a: kda_intra_chunk_fwd(*a)[:2]
+                    t_pallas = benchmark_fn("Pallas", pallas_wrapper, args_pallas)
+                    
+                    speedup = t_jax / t_pallas
+                    print(f"{B:<4} | {T:<6} | {H:<3} | {D:<4} | {CHUNK_SIZE:<4} | {t_jax:<10.3f} | {t_pallas:<12.3f} | {speedup:<8.2f}x")
+                    
+                except Exception as e:
+
+                    print(f"{B:<4} | {T:<6} | {H:<3} | {D:<3} | {'ERROR':<10} | {'ERROR':<12} | {str(e)}")
 
 if __name__ == "__main__":
     main()

@@ -72,15 +72,20 @@ def kda_intra_chunk_kernel(
     # Inputs (Ref)
     q_ref, k_ref, g_ref, beta_ref, v_ref, segment_ids_ref,
     # Outputs (Ref)
-    u_out_ref, w_out_ref, qg_out_ref, kg_out_ref, Aqk_out_ref, Akk_inv_out_ref,
+    u_out_ref, w_out_ref, 
+    *rest_refs,
     # Config
     chunk_size: int,
     head_dim: int,
     scale: float,
+    output_qg_kg: bool = True,
 ):
+    if output_qg_kg:
+        qg_out_ref, kg_out_ref, Aqk_out_ref, Akk_inv_out_ref = rest_refs
+    else:
+        Aqk_out_ref, Akk_inv_out_ref = rest_refs
+
     dtype = q_ref.dtype
-    # Load inputs into VMEM
-    # q: (C, D), k: (C, D), g: (C, D), beta: (C, 1), v: (C, D)
     q = q_ref[0, 0, 0]
     k = k_ref[0, 0, 0]
     g = g_ref[0, 0, 0]
@@ -88,7 +93,7 @@ def kda_intra_chunk_kernel(
     v = v_ref[0, 0, 0]
     segment_ids = segment_ids_ref[0, 0, 0, :, 0] 
 
-    # 1. Compute A matrix using factorization for TPU MXU efficiency
+    # ompute A matrix using factorization for TPU MXU efficiency
     # Factorization: exp2(g_i - g_j) = exp2(g_i - g_ref) * exp2(g_ref - g_j)
     # We choose g_ref to be the middle of the chunk for numerical stability (Safe Gate)
     
@@ -97,23 +102,10 @@ def kda_intra_chunk_kernel(
     g_ref_val = g[g_ref_idx][None, :] # (1, D)
     g_centered = (g.astype(jnp.float32) - g_ref_val.astype(jnp.float32)) # (C, D)
 
-    # Compute Q and K states for matrix multiplication
-    # q_state = q * exp2(g - g_ref)
-    # k_state = k * exp2(g_ref - g)
     q_state = q * jnp.exp2(g_centered).astype(q.dtype)
-    
-    # Re-use k_state logic for both Aqk and Akk
-    # For Akk: K * exp2(g - g_ref) vs K * exp2(g_ref - g) logic
-    # In original kda: A_ij = k_i * k_j * exp2(g_i - g_j)
-    # = (k_i * exp2(g_i - g_ref)) * (k_j * exp2(g_ref - g_j))
-    # Let's call them k_state_q (acts like query) and k_state_k (acts like key)
     k_state_q = k * jnp.exp2(g_centered)
     k_state_k = k * jnp.exp2(-g_centered)
     
-    # Perform Matrix Multiplication (C, D) @ (D, C) -> (C, C)
-    # This maps to TPU MXU instructions
-    # 256x256xbf16 * 256x256xbf16 -> 256x256xf32
-    # Akk = k_state_q @ k_state_k.T
     Akk_raw = jax.lax.dot_general(
         k_state_q.astype(k.dtype), 
         k_state_k.astype(k.dtype), 
@@ -122,44 +114,26 @@ def kda_intra_chunk_kernel(
         preferred_element_type=jnp.float32
     ).astype(dtype)
     
-    # Aqk = q_state @ k_state_k.T * scale
     Aqk_raw = jax.lax.dot_general(
         q_state, k_state_k,
         (((1,), (1,)), ((), ())),
-        # precision=jax.lax.Precision.HIGHEST
+        # precision=jax.lax.Precision.HIGHEST,
         preferred_element_type=jnp.float32
     ).astype(dtype)
     
-    # Apply Mask and Beta
     idx = jnp.arange(chunk_size, dtype=jnp.int32)
     causal_mask = idx[:, None] > idx[None, :]
     causal_mask_qk = idx[:, None] >= idx[None, :] # Aqk usually includes diagonal
 
     # Segment mask: i and j must belong to the same segment
-    # segment_ids: (C,)
     segment_mask = segment_ids[:, None] == segment_ids[None, :]
-    # Combine masks
     mask = causal_mask & segment_mask
     mask_qk = causal_mask_qk & segment_mask
 
-    # Akk[i, j] = Akk_raw[i, j] * beta[i] if i > j else 0
     Akk = jnp.where(mask, Akk_raw * beta, 0.0)
-    
-    # Aqk[i, j] = Aqk_raw[i, j] * scale if i >= j else 0
     Aqk = jnp.where(mask_qk, Aqk_raw * scale, 0.0)
 
-    # 2. Batch solve for u and w and Akk_inv
-    # (I + Akk) u = v * beta
-    # (I + Akk) w = k * exp2(g) * beta
-    # (I + Akk) Akk_inv = I
-    
-    # Apply beta to RHS inputs BEFORE solving
-    # jax.debug.print("v shape:{}", v.shape)
-    # jax.debug.print("beta shape:{}", beta.shape)
     v_scaled = v * beta
-    # jax.debug.print("v max: {v_max}, min: {v_min}", v_max=jnp.max(v), v_min=jnp.min(v))
-    # jax.debug.print("beta max: {beta_max}, min: {beta_min}", beta_max=jnp.max(beta), beta_min=jnp.min(beta))
-    # jax.debug.print("v_scaled max: {v_scaled_max}, min: {v_scaled_min}", v_scaled_max=jnp.max(v_scaled), v_scaled_min=jnp.min(v_scaled))
     target_w = k * jnp.exp2(g) * beta
     identity = jnp.eye(chunk_size, dtype=v.dtype)
     
@@ -170,19 +144,21 @@ def kda_intra_chunk_kernel(
     w = combined_x[:, head_dim:2*head_dim]
     Akk_inv = combined_x[:, 2*head_dim:]
     
-    qg = q * jnp.exp2(g)
-    
-    g_last = g[chunk_size-1][None, :]
-    kg = k * jnp.exp2(g_last - g)
-
     u_out_ref[0, 0, 0] = u.astype(u_out_ref.dtype)
     w_out_ref[0, 0, 0] = w.astype(w_out_ref.dtype)
-    qg_out_ref[0, 0, 0] = qg
-    kg_out_ref[0, 0, 0] = kg
+    
+    if output_qg_kg:
+        qg = q * jnp.exp2(g)
+        g_last = g[chunk_size-1][None, :]
+        kg = k * jnp.exp2(g_last - g)
+        
+        qg_out_ref[0, 0, 0] = qg
+        kg_out_ref[0, 0, 0] = kg
+        
     Aqk_out_ref[0, 0, 0] = Aqk
     Akk_inv_out_ref[0, 0, 0] = Akk_inv.astype(Akk_inv_out_ref.dtype)
 
-@functools.partial(jax.jit, static_argnames=['chunk_size', 'scale'])
+@functools.partial(jax.jit, static_argnames=['chunk_size', 'scale', 'disable_recompute'])
 def kda_intra_chunk_fwd(
     q: jax.Array,
     k: jax.Array,
@@ -191,7 +167,8 @@ def kda_intra_chunk_fwd(
     v: jax.Array,
     segment_ids: jax.Array = None,
     scale: float = 1.0,
-    chunk_size: int = 128
+    chunk_size: int = 128,
+    disable_recompute: bool = False
 ):
     """
     Pallas implementation of KDA Intra-Chunk Forward Pass.
@@ -206,23 +183,41 @@ def kda_intra_chunk_fwd(
                      Tokens with different IDs will not attend to each other.
         scale: Attention scale factor
         chunk_size: Block size for Pallas kernel.
+        disable_recompute: Whether to compute and return qg, kg (used for recomputation in backward pass).
+                           If True, qg and kg are computed and returned.
+                           If False, qg and kg are None (default, to save memory bandwidth).
         
     Returns:
         u: (B, H, T, D)
         w: (B, H, T, D)
-        qg: (B, H, T, D)
-        kg: (B, H, T, D)
+        qg: (B, H, T, D) or None
+        kg: (B, H, T, D) or None
         Aqk: (B, H, num_chunks, chunk_size, chunk_size)
         Akk_inv: (B, H, num_chunks, chunk_size, chunk_size)
     """
     B, H, T, D = k.shape
-    assert T % chunk_size == 0, "Sequence length must be divisible by chunk_size"
-    num_chunks = T // chunk_size
+    
+    # Handle padding if T is not divisible by chunk_size
+    remainder = T % chunk_size
+    pad_len = (chunk_size - remainder) % chunk_size
+    
+    if pad_len > 0:
+        q = jnp.pad(q, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
+        k = jnp.pad(k, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
+        # Pad g with edge mode to avoid large jumps in exp2(g - g_ref)
+        g = jnp.pad(g, ((0, 0), (0, 0), (0, pad_len), (0, 0)), mode='edge')
+        beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad_len)))
+        v = jnp.pad(v, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
+        if segment_ids is not None:
+            segment_ids = jnp.pad(segment_ids, ((0, 0), (0, pad_len)))
+    
+    padded_T = T + pad_len
+    num_chunks = padded_T // chunk_size
 
     # Handle segment_ids
     if segment_ids is None:
         # Default: all tokens belong to segment 0 (or distinct segments per batch, doesn't matter since B dim is separated)
-        segment_ids = jnp.zeros((B, T), dtype=jnp.int32)
+        segment_ids = jnp.zeros((B, padded_T), dtype=jnp.int32)
     
     # Reshape to expose chunks: (B, H, num_chunks, chunk_size, D)
     q_reshaped = q.reshape(B, H, num_chunks, chunk_size, D)
@@ -233,19 +228,42 @@ def kda_intra_chunk_fwd(
     segment_ids_reshaped = segment_ids.reshape(B, 1, num_chunks, chunk_size, 1)
     
     grid = (B, H, num_chunks)
-    
-    # Pallas Call
-    u_reshaped, w_reshaped, qg_reshaped, kg_reshaped, Aqk_reshaped, Akk_inv_reshaped = pl.pallas_call(
-        functools.partial(kda_intra_chunk_kernel, chunk_size=chunk_size, head_dim=D, scale=scale),
-        # interpret=True,
-        out_shape=[
-            jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype), # u
-            jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype), # w
+
+    output_qg_kg = disable_recompute
+
+    out_shape = [
+        jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype), # u
+        jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype), # w
+    ]
+    out_specs = [
+        pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # u
+        pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # w
+    ]
+
+    if output_qg_kg:
+        out_shape.extend([
             jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype), # qg
             jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype), # kg
-            jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, chunk_size), dtype=k.dtype), # Aqk
-            jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, chunk_size), dtype=k.dtype), # Akk_inv
-        ],
+        ])
+        out_specs.extend([
+            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # qg
+            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # kg
+        ])
+
+    out_shape.extend([
+        jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, chunk_size), dtype=k.dtype), # Aqk
+        jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, chunk_size), dtype=k.dtype), # Akk_inv
+    ])
+    out_specs.extend([
+        pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, chunk_size)), # Aqk
+        pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, chunk_size)), # Akk_inv
+    ])
+    
+    # Pallas Call
+    results = pl.pallas_call(
+        functools.partial(kda_intra_chunk_kernel, chunk_size=chunk_size, head_dim=D, scale=scale, output_qg_kg=output_qg_kg),
+        # interpret=True,
+        out_shape=out_shape,
         in_specs=[
             pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # q
             pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # k
@@ -254,23 +272,231 @@ def kda_intra_chunk_fwd(
             pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # v
             pl.BlockSpec(index_map=lambda i, j, l: (i, 0, l, 0, 0), block_shape=(1, 1, 1, chunk_size, 1)), # segment_ids
         ],
-        out_specs=[
-            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # u
-            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # w
-            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # qg
-            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # kg
-            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, chunk_size)), # Aqk
-            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, chunk_size)), # Akk_inv
-        ],
+        out_specs=out_specs,
         grid=grid,
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel","parallel")),
     )(q_reshaped, k_reshaped, g_reshaped, beta_reshaped, v_reshaped, segment_ids_reshaped)
     
+    if output_qg_kg:
+        u_reshaped, w_reshaped, qg_reshaped, kg_reshaped, Aqk_reshaped, Akk_inv_reshaped = results
+    else:
+        u_reshaped, w_reshaped, Aqk_reshaped, Akk_inv_reshaped = results
+        qg_reshaped, kg_reshaped = None, None
+
+    u = u_reshaped.reshape(B, H, padded_T, D)
+    w = w_reshaped.reshape(B, H, padded_T, D)
+
+    if qg_reshaped is not None:
+        qg = qg_reshaped.reshape(B, H, padded_T, D)
+        kg = kg_reshaped.reshape(B, H, padded_T, D)
+    else:
+        qg, kg = None, None
+
+    if pad_len > 0:
+        u = u[:, :, :T, :]
+        w = w[:, :, :T, :]
+        if qg is not None:
+            qg = qg[:, :, :T, :]
+            kg = kg[:, :, :T, :]
+
     return (
-        u_reshaped.reshape(B, H, T, D),
-        w_reshaped.reshape(B, H, T, D),
-        qg_reshaped.reshape(B, H, T, D),
-        kg_reshaped.reshape(B, H, T, D),
+        u,
+        w,
+        qg,
+        kg,
         Aqk_reshaped,
         Akk_inv_reshaped
+    )
+
+def kda_intra_chunk_bwd_kernel(
+    # Inputs (Ref)
+    q_ref, k_ref, g_ref, beta_ref, segment_ids_ref,
+    dAqk_ref, dAkk_ref,
+    # Outputs (Ref)
+    dq_ref, dk_ref, dg_ref, dbeta_ref,
+    # Config
+    chunk_size: int,
+    head_dim: int,
+    scale: float,
+):
+    dtype = q_ref.dtype
+    q = q_ref[0, 0, 0]
+    k = k_ref[0, 0, 0]
+    g = g_ref[0, 0, 0]
+    beta = beta_ref[0, 0, 0]
+    segment_ids = segment_ids_ref[0, 0, 0, :, 0]
+    
+    dAqk = dAqk_ref[0, 0, 0]
+    dAkk = dAkk_ref[0, 0, 0]
+
+    # Recompute states (Forward Pass Logic)
+    g_ref_idx = chunk_size // 2
+    g_ref_val = g[g_ref_idx][None, :]
+    g_centered = g.astype(jnp.float32) - g_ref_val.astype(jnp.float32)
+    
+    q_state = q * jnp.exp2(g_centered).astype(q.dtype)
+    k_state_q = k * jnp.exp2(g_centered).astype(k.dtype)
+    k_state_k = k * jnp.exp2(-g_centered).astype(k.dtype)
+
+    # Recompute masks
+    idx = jnp.arange(chunk_size, dtype=jnp.int32)
+    causal_mask = idx[:, None] >= idx[None, :]
+    causal_mask_qk = idx[:, None] >= idx[None, :]
+    segment_mask = segment_ids[:, None] == segment_ids[None, :]
+    
+    mask_akk = causal_mask & segment_mask
+    mask_aqk = causal_mask_qk & segment_mask
+    
+    dAqk_masked = jnp.where(mask_aqk, dAqk, 0.0) * scale
+    dAkk_masked = jnp.where(mask_akk, dAkk, 0.0)
+    
+    Akk_raw = jax.lax.dot_general(
+        k_state_q,
+        k_state_k,
+        (((1,), (1,)), ((), ())),
+        # precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32
+    )
+    dbeta = jnp.sum(dAkk_masked * Akk_raw, axis=1, keepdims=True).astype(beta.dtype)
+    
+    dAkk_raw = dAkk_masked * beta
+
+    dq_state = jax.lax.dot_general(
+        dAqk_masked, k_state_k,
+        (((1,), (0,)), ((), ())), # (C, C) @ (C, D) -> (C, D)
+        # precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32
+    )
+
+    # dk_state_k part 1 from Aqk: dAqk_masked.T @ q_state
+    dk_state_k_1 = jax.lax.dot_general(
+        dAqk_masked, q_state,
+        (((0,), (0,)), ((), ())), # (C, C).T @ (C, D) -> (C, D)
+        # precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32
+    )
+
+    dk_state_q = jax.lax.dot_general(
+        dAkk_raw, k_state_k,
+        (((1,), (0,)), ((), ())),
+        # precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32
+    )
+    exp_g = jnp.exp2(g_centered).astype(dtype)
+    exp_neg_g = jnp.exp2(-g_centered).astype(dtype)
+
+    dk_state_k_2 = jax.lax.dot_general(
+        dAkk_raw, k_state_q,
+        (((0,), (0,)), ((), ())),
+        # precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32
+    )
+    
+    dk_state_k = dk_state_k_1 + dk_state_k_2
+    dq = (dq_state * exp_g).astype(dtype)
+    dk = (dk_state_q * exp_g + dk_state_k * exp_neg_g).astype(dtype)
+    dg_c = (dq_state * q_state + dk_state_q * k_state_q - dk_state_k * k_state_k) 
+    
+    # Handle g_ref gradient subtraction
+    dg_ref_grad = -jnp.sum(dg_c, axis=0, keepdims=False) # (D,)
+    dg = dg_c
+    
+    idx_range = jnp.arange(chunk_size, dtype=jnp.int32)
+    mask_ref_bool = (idx_range == g_ref_idx)
+    mask_ref = jnp.reshape(mask_ref_bool.astype(dg.dtype), (chunk_size, 1))
+    dg = dg + mask_ref * dg_ref_grad[None, :].astype(dg.dtype)
+    
+    dq_ref[0, 0, 0] = dq
+    dk_ref[0, 0, 0] = dk
+    dg_ref[0, 0, 0] = dg.astype(dtype)
+    dbeta_ref[0, 0, 0] = dbeta
+
+@functools.partial(jax.jit, static_argnames=['chunk_size', 'scale'])
+def kda_intra_chunk_bwd(
+    q: jax.Array,
+    k: jax.Array,
+    g: jax.Array,
+    beta: jax.Array,
+    segment_ids: jax.Array,
+    dAqk: jax.Array,
+    dAkk: jax.Array,
+    scale: float = 1.0,
+    chunk_size: int = 128
+):
+    """
+    Pallas implementation of KDA Intra-Chunk Backward Pass.
+    """
+    B, H, T, D = k.shape
+    
+    # Handle padding if T is not divisible by chunk_size
+    remainder = T % chunk_size
+    pad_len = (chunk_size - remainder) % chunk_size
+    
+    if pad_len > 0:
+        q = jnp.pad(q, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
+        k = jnp.pad(k, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
+        # Pad g with edge mode
+        g = jnp.pad(g, ((0, 0), (0, 0), (0, pad_len), (0, 0)), mode='edge')
+        beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad_len)))
+        if segment_ids is not None:
+            segment_ids = jnp.pad(segment_ids, ((0, 0), (0, pad_len)))
+
+    padded_T = T + pad_len
+    num_chunks = padded_T // chunk_size
+
+    if segment_ids is None:
+        segment_ids = jnp.zeros((B, padded_T), dtype=jnp.int32)
+    
+    q_reshaped = q.reshape(B, H, num_chunks, chunk_size, D)
+    k_reshaped = k.reshape(B, H, num_chunks, chunk_size, D)
+    g_reshaped = g.reshape(B, H, num_chunks, chunk_size, D)
+    beta_reshaped = beta.reshape(B, H, num_chunks, chunk_size, 1)
+    segment_ids_reshaped = segment_ids.reshape(B, 1, num_chunks, chunk_size, 1)
+    
+    grid = (B, H, num_chunks)
+    
+    dq_reshaped, dk_reshaped, dg_reshaped, dbeta_reshaped = pl.pallas_call(
+        functools.partial(kda_intra_chunk_bwd_kernel, chunk_size=chunk_size, head_dim=D, scale=scale),
+        interpret=True,
+        out_shape=[
+            jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype), # dq
+            jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype), # dk
+            jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, D), dtype=k.dtype), # dg
+            jax.ShapeDtypeStruct(shape=(B, H, num_chunks, chunk_size, 1), dtype=k.dtype), # dbeta
+        ],
+        in_specs=[
+            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # q
+            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # k
+            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # g
+            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, 1)), # beta
+            pl.BlockSpec(index_map=lambda i, j, l: (i, 0, l, 0, 0), block_shape=(1, 1, 1, chunk_size, 1)), # segment_ids
+            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, chunk_size)), # dAqk
+            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, chunk_size)), # dAkk
+        ],
+        out_specs=[
+            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # dq
+            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # dk
+            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, D)), # dg
+            pl.BlockSpec(index_map=lambda i, j, l: (i, j, l, 0, 0), block_shape=(1, 1, 1, chunk_size, 1)), # dbeta
+        ],
+        grid=grid,
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel","parallel")),
+    )(q_reshaped, k_reshaped, g_reshaped, beta_reshaped, segment_ids_reshaped, dAqk, dAkk)
+    
+    dq = dq_reshaped.reshape(B, H, padded_T, D)
+    dk = dk_reshaped.reshape(B, H, padded_T, D)
+    dg = dg_reshaped.reshape(B, H, padded_T, D)
+    dbeta = dbeta_reshaped.reshape(B, H, padded_T)
+    
+    if pad_len > 0:
+        dq = dq[:, :, :T, :]
+        dk = dk[:, :, :T, :]
+        dg = dg[:, :, :T, :]
+        dbeta = dbeta[:, :, :T]
+
+    return (
+        dq,
+        dk,
+        dg,
+        dbeta
     )
