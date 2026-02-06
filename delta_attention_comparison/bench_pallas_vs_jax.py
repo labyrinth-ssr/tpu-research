@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import functools
+import traceback
 
 # Add project root to path to ensure imports work
 import sys
@@ -134,6 +135,7 @@ def main():
     # Batch sizes and Sequence lengths to test
     configs = [
         # (Batch, SeqLen)
+        # (1,1024)
         (4, 8192),
         # (1, 4096),
         # (2, 4096),
@@ -182,8 +184,8 @@ def main():
                     print(f"{B:<4} | {T:<6} | {H:<3} | {D:<4} | {CHUNK_SIZE:<4} | {t_jax:<10.3f} | {t_pallas:<12.3f} | {speedup:<8.2f}x")
                     
                 except Exception as e:
-
                     print(f"{B:<4} | {T:<6} | {H:<3} | {D:<3} | {'ERROR':<10} | {'ERROR':<12} | {str(e)}")
+                    traceback.print_exc()
 
 if __name__ == "__main__":
     main()
